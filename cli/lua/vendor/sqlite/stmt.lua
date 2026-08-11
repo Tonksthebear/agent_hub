@@ -52,12 +52,14 @@ end
 ---Frees the prepared statement
 ---@return boolean: if no error true.
 function sqlstmt:finalize()
-  self.errcode = clib.finalize(self.pstmt)
-  self.finalized = self.errcode == flags.ok
+  local finalize_code = clib.finalize(self.pstmt)
+  self.finalized = true
+  self.errcode = self.step_error or finalize_code
   assert(
-    self.finalized,
+    self.errcode == flags.ok,
     string.format(
-      "sqlite.lua: couldn't finalize statement, ERRMSG: %s stmt = (%s)",
+      "sqlite.lua: statement failed with code %s, ERRMSG: %s stmt = (%s)",
+      tostring(self.errcode),
       clib.to_str(clib.errmsg(self.conn)),
       self.str
     )
@@ -69,10 +71,9 @@ end
 ---@return sqlite_flags: Possible Flags: { flags.busy, flags.done, flags.row, flags.error, flags.misuse }
 function sqlstmt:step()
   local step_code = clib.step(self.pstmt)
-  assert(
-    step_code ~= flags.error or step_code ~= flags.misuse,
-    string.format("sqlite.lua: error in step(), ERRMSG: %s. Please report issue.", clib.to_str(clib.errmsg(self.conn)))
-  )
+  if step_code ~= flags.row and step_code ~= flags.done then
+    self.step_error = step_code
+  end
   return step_code
 end
 

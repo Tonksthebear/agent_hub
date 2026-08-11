@@ -30,17 +30,21 @@ local sqlite_defs = require("sqlite.defs")
 local hub_state = require("hub.state")
 
 -- Patch `sqlite.defs.wrap_stmts` once at module load. Upstream's implementation
--- wraps its callback in bare BEGIN/COMMIT; when the user calls
+-- wraps its callback in bare BEGIN/COMMIT without checking either statement or
+-- rolling back after a callback error. A failed statement can therefore leave
+-- the connection inside an open transaction and block every later writer.
+--
+-- When the user calls
 -- `db:execute(fn)` and `fn` invokes `db.t:insert{...}` (which internally calls
 -- `wrap_stmts`) the inner BEGIN errors quietly and the inner COMMIT then
 -- closes the user's outer transaction — silently defeating rollback. We swap
--- in a shim that skips its own BEGIN/COMMIT when a connection is already
--- inside a plugin-db user transaction, so the outer tx controls commit/rollback.
+-- in a shim that provides checked BEGIN/COMMIT/ROLLBACK handling and skips its
+-- own transaction when a connection is already inside a plugin-db user
+-- transaction, so the outer tx controls commit/rollback.
 -- `sqlite.defs` installs a metatable __index that falls through to FFI
 -- symbols (`sqlite3_<k>`) for any missing key; use rawget to probe for our
 -- patch sentinel without accidentally triggering a bogus symbol lookup.
 if not rawget(sqlite_defs, "__plugin_db_wrap_patched") then
-    local original_wrap_stmts = rawget(sqlite_defs, "wrap_stmts")
     -- Set of connection pointers currently inside `db:execute(fn)`.
     -- Keyed by `tostring(conn_ptr)` so the FFI cdata comparison works.
     local in_user_tx = {}
@@ -49,7 +53,47 @@ if not rawget(sqlite_defs, "__plugin_db_wrap_patched") then
         if in_user_tx[tostring(conn_ptr)] then
             return fn()
         end
-        return original_wrap_stmts(conn_ptr, fn)
+
+        local function execute_control(statement)
+            local code = sqlite_defs.exec_stmt(conn_ptr, statement)
+            if code ~= sqlite_defs.flags.ok then
+                error(string.format(
+                    "plugin.db: %s failed: %s",
+                    statement,
+                    sqlite_defs.last_errmsg(conn_ptr)
+                ), 0)
+            end
+        end
+
+        execute_control("BEGIN")
+        local results = table.pack(pcall(fn))
+        if not results[1] then
+            local callback_error = results[2]
+            local rollback_ok, rollback_error = pcall(execute_control, "ROLLBACK")
+            if not rollback_ok then
+                error(string.format(
+                    "%s; rollback also failed: %s",
+                    tostring(callback_error),
+                    tostring(rollback_error)
+                ), 0)
+            end
+            error(callback_error, 0)
+        end
+
+        local commit_ok, commit_error = pcall(execute_control, "COMMIT")
+        if not commit_ok then
+            local rollback_ok, rollback_error = pcall(execute_control, "ROLLBACK")
+            if not rollback_ok then
+                error(string.format(
+                    "%s; rollback also failed: %s",
+                    tostring(commit_error),
+                    tostring(rollback_error)
+                ), 0)
+            end
+            error(commit_error, 0)
+        end
+
+        return table.unpack(results, 2, results.n)
     end)
     rawset(sqlite_defs, "__plugin_db_wrap_patched", true)
 end

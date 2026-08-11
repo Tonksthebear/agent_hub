@@ -498,6 +498,7 @@ fn worker_loop(
     }
 
     if let Err(err) = load_plugin_into_worker(&runtime, &spec) {
+        close_worker_plugin_databases(&runtime, &spec.plugin_key);
         let _ = ready_tx.send(Err(err));
         return;
     }
@@ -558,6 +559,26 @@ fn worker_loop(
                 runtime.fire_local_webhook_request(request);
             }
         }
+    }
+
+    close_worker_plugin_databases(&runtime, &spec.plugin_key);
+}
+
+fn close_worker_plugin_databases(runtime: &LuaRuntime, plugin_key: &str) {
+    if let Err(err) = runtime
+        .lua()
+        .load(
+            r#"
+            local ok, plugin_db = pcall(require, "lib.plugin_db")
+            if ok and plugin_db and type(plugin_db.shutdown_all) == "function" then
+                plugin_db.shutdown_all()
+            end
+            "#,
+        )
+        .set_name("plugin_worker_close_databases")
+        .exec()
+    {
+        log::warn!("plugin worker {plugin_key} failed to close plugin databases: {err}");
     }
 }
 
@@ -1229,6 +1250,35 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn worker_database_cleanup_calls_plugin_db_shutdown() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        runtime
+            .lua()
+            .load(
+                r#"
+                package.preload["lib.plugin_db"] = function()
+                  return {
+                    shutdown_all = function()
+                      _G.plugin_database_shutdown_called = true
+                    end,
+                  }
+                end
+                "#,
+            )
+            .exec()
+            .expect("install fake plugin.db module");
+
+        close_worker_plugin_databases(&runtime, "test-plugin");
+
+        let called: bool = runtime
+            .lua()
+            .globals()
+            .get("plugin_database_shutdown_called")
+            .expect("read shutdown flag");
+        assert!(called, "worker cleanup must close all plugin databases");
+    }
 
     #[test]
     fn load_wait_services_worker_parent_hub_requests() {

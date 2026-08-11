@@ -434,6 +434,106 @@ fn execute_fn_rolls_back_on_error() {
     );
 }
 
+#[test]
+fn failed_table_write_rolls_back_and_connection_remains_usable() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "failed-write");
+
+    let (failed, later_insert_works, row_count): (bool, bool, i64) = lua
+        .load(
+            r#"
+            local db = plugin.db{
+                memory = true,
+                version = 1,
+                models = {
+                    counters = {
+                        id = true,
+                        name = { 'text', required = true },
+                    },
+                },
+            }
+
+            db:execute([[
+                CREATE TRIGGER reject_counters
+                BEFORE INSERT ON counters
+                BEGIN
+                    SELECT RAISE(ABORT, 'reject insert');
+                END
+            ]])
+            local ok = pcall(function()
+                db.counters:insert{ name = 'blocked' }
+            end)
+            db:execute('DROP TRIGGER reject_counters')
+
+            local later_ok = pcall(function()
+                db.counters:insert{ name = 'fresh' }
+            end)
+            return not ok, later_ok, #db.counters:get{}
+            "#,
+        )
+        .eval()
+        .expect("recover after failed table write");
+
+    assert!(failed, "the trigger must reject the first table write");
+    assert!(
+        later_insert_works,
+        "a failed table write must not leave an open transaction"
+    );
+    assert_eq!(row_count, 1, "only the later table write must persist");
+}
+
+#[test]
+fn locked_table_write_rolls_back_and_connection_remains_usable() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    let database_path = tmp.path().join("contention.sqlite");
+    lua.globals()
+        .set("contention_database_path", database_path.to_string_lossy())
+        .unwrap();
+
+    let (locked, later_insert_works, row_count): (bool, bool, i64) = lua
+        .load(
+            r#"
+            local sqlite = require('vendor.sqlite')
+            local first = sqlite.new(contention_database_path)
+            local second = sqlite.new(contention_database_path)
+            first:open()
+            second:open()
+            first:execute('PRAGMA journal_mode = WAL')
+            second:execute('PRAGMA busy_timeout = 10')
+            first:execute('CREATE TABLE counters (id INTEGER PRIMARY KEY, name TEXT NOT NULL)')
+
+            first:execute('BEGIN IMMEDIATE')
+            local ok = pcall(function()
+                second:insert('counters', { name = 'blocked' })
+            end)
+            first:execute('ROLLBACK')
+
+            local later_ok = pcall(function()
+                second:insert('counters', { name = 'fresh' })
+            end)
+            local rows = second:eval('SELECT * FROM counters')
+            second:close()
+            first:close()
+            return not ok, later_ok, #rows
+            "#,
+        )
+        .eval()
+        .expect("recover after SQLite lock");
+
+    assert!(locked, "the first connection must block the second write");
+    assert!(
+        later_insert_works,
+        "a locked table write must not leave an open transaction"
+    );
+    assert_eq!(row_count, 1, "only the later table write must persist");
+}
+
 // ============================================================================
 // 7. test_eval_escape_hatch (raw SQL with placeholders)
 // ============================================================================
