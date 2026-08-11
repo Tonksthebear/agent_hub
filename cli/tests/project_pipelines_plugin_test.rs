@@ -318,6 +318,188 @@ fn catalog_plugin_project_pipelines_spawn_controls_resolve_options_from_target_i
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_refreshes_merged_checkouts_with_explicit_gates() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local gates = {{}}
+            local notifications = {{}}
+            local appended = {{}}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid ~= "sess-orchestrator" then return nil end
+                return {{
+                  info = function()
+                    return {{ worktree_path = "/repo/project" }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  run_command_gate = function(_, opts)
+                    gates[#gates + 1] = opts
+                    return {{ started = true }}
+                  end,
+                  notify = function(_, session_uuid, payload)
+                    notifications[#notifications + 1] = {{ session_uuid = session_uuid, payload = payload }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function()
+                return {{ id = "ticket-1", title = "Ship", project_id = "project-1", target_id = "target-1" }}
+              end,
+              latest_ticket_run = function() return nil end,
+              ticket_session_uuids = function() return {{}} end,
+              close_ticket = function() return {{ id = "ticket-1", status = "closed" }} end,
+              get_question_orchestrator = function(project_id)
+                if project_id == "project-1" then
+                  return {{ session_uuid = "sess-orchestrator", scope = "project" }}
+                end
+                return nil
+              end,
+              resolve_target_path = function() return "/repo/project" end,
+              append_event = function(kind, attrs)
+                appended[#appended + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.close_ticket("ticket-1", {{
+              merge_confirmed = true,
+              merge_commit = "abc123",
+              base_branch = "main",
+            }})
+
+            assert(#notifications == 1, "merge delivery must send one alert")
+            assert(notifications[1].payload.title == "Pipeline ticket merged")
+            assert(notifications[1].payload.action.kind == "ticket_merged")
+            assert(#gates == 1, "one checkout path must start one refresh")
+            assert(gates[1].command == "git branch --show-current")
+            assert(not gates[1].command:find(";", 1, true))
+            assert(gates[1].context.operation == "merge_source_branch")
+
+            local function context(operation)
+              return {{
+                owner_plugin = "project-pipelines",
+                operation = operation,
+                request_id = "refresh-1",
+                session_uuid = "sess-orchestrator",
+                checkout_path = "/repo/project",
+                base_branch = "main",
+                ticket_id = "ticket-1",
+              }}
+            end
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "",
+              context = context("merge_source_branch"),
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "skipped_detached")
+            assert(#gates == 1, "detached HEAD must not start another gate")
+            assert(#notifications == 1, "detached HEAD must not add an alert")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "feature\n",
+              context = context("merge_source_branch"),
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "skipped_other_branch")
+            assert(#gates == 1, "another branch must not start another gate")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "main\n",
+              context = context("merge_source_branch"),
+            }})
+            assert(gates[#gates].command == "git status --porcelain")
+            local status_context = gates[#gates].context
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = " M local.lua\n",
+              context = status_context,
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "skipped_local_changes")
+            assert(#notifications == 1, "local changes must not add an alert")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "",
+              context = status_context,
+            }})
+            local pull_gate = gates[#gates]
+            assert(pull_gate.command == "git pull --no-rebase --no-autostash --no-edit origin 'main'")
+            assert(not pull_gate.command:find(";", 1, true))
+            assert(not pull_gate.command:find("=", 1, true))
+            assert(pull_gate.env.GIT_TERMINAL_PROMPT == "0")
+            assert(pull_gate.env.GIT_MERGE_AUTOEDIT == "no")
+
+            engine.handle_command_gate_completed({{
+              success = false,
+              exit_status = 1,
+              error = "pull failed",
+              context = pull_gate.context,
+            }})
+            local conflict_gate = gates[#gates]
+            assert(conflict_gate.command == "git diff --name-only --diff-filter=U")
+            assert(#notifications == 1, "pull failure must wait for Git conflict evidence")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "",
+              context = conflict_gate.context,
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "failed")
+            assert(#notifications == 2)
+            assert(notifications[2].payload.title == "Merged ticket checkout refresh failed")
+            assert(not notifications[2].payload.body:lower():find("conflict", 1, true))
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              stdout_tail = "engine.lua\n",
+              context = context("merge_source_conflicts"),
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "conflicted")
+            assert(#notifications == 3)
+            assert(notifications[3].payload.title == "Merged ticket has checkout conflicts")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              context = context("merge_source_pull"),
+            }})
+            assert(appended[#appended].attrs.payload.pull_status == "updated")
+            assert(#notifications == 3, "a successful refresh must not duplicate the merge alert")
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("merged checkout refresh should use explicit asynchronous command gates");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_pr_policy_rejects_closing_open_pr() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
