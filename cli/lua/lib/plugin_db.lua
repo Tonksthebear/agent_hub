@@ -531,18 +531,41 @@ local function wrap_db(raw_db, spec)
                 return class_execute(self, arg)
             end
             local ptr_key = tostring(self.conn)
-            USER_TX_SET[ptr_key] = true
-            class_execute(self, "BEGIN")
-            local ok, result = pcall(arg, self)
-            if ok then
-                class_execute(self, "COMMIT")
-                USER_TX_SET[ptr_key] = nil
-                return result
-            else
-                pcall(class_execute, self, "ROLLBACK")
-                USER_TX_SET[ptr_key] = nil
-                error(result, 0)
+            local begin_ok, begin_error = pcall(class_execute, self, "BEGIN")
+            if not begin_ok then
+                error(begin_error, 0)
             end
+
+            USER_TX_SET[ptr_key] = true
+            local results = table.pack(pcall(arg, self))
+            if results[1] then
+                local commit_ok, commit_error = pcall(class_execute, self, "COMMIT")
+                USER_TX_SET[ptr_key] = nil
+                if not commit_ok then
+                    local rollback_ok, rollback_error = pcall(class_execute, self, "ROLLBACK")
+                    if not rollback_ok then
+                        error(string.format(
+                            "%s; rollback also failed: %s",
+                            tostring(commit_error),
+                            tostring(rollback_error)
+                        ), 0)
+                    end
+                    error(commit_error, 0)
+                end
+                return table.unpack(results, 2, results.n)
+            end
+
+            local callback_error = results[2]
+            local rollback_ok, rollback_error = pcall(class_execute, self, "ROLLBACK")
+            USER_TX_SET[ptr_key] = nil
+            if not rollback_ok then
+                error(string.format(
+                    "%s; rollback also failed: %s",
+                    tostring(callback_error),
+                    tostring(rollback_error)
+                ), 0)
+            end
+            error(callback_error, 0)
         end)
         rawset(raw_db, "__plugin_db_execute_wrapped", true)
     end

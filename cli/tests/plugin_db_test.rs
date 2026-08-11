@@ -534,6 +534,57 @@ fn locked_table_write_rolls_back_and_connection_remains_usable() {
     assert_eq!(row_count, 1, "only the later table write must persist");
 }
 
+#[test]
+fn failed_transaction_commit_rolls_back_and_connection_remains_usable() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "failed-commit");
+
+    let (commit_failed, later_transaction_works, child_count): (bool, bool, i64) = lua
+        .load(
+            r#"
+            local db = plugin.db{ memory = true, version = 1 }
+            db:execute([[
+                CREATE TABLE parents (id INTEGER PRIMARY KEY)
+            ]])
+            db:execute([[
+                CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES parents(id)
+                        DEFERRABLE INITIALLY DEFERRED
+                )
+            ]])
+
+            local ok = pcall(function()
+                db:execute(function(self)
+                    self:eval('INSERT INTO children (id, parent_id) VALUES (1, 999)')
+                end)
+            end)
+
+            local later_ok = pcall(function()
+                db:execute(function(self)
+                    self:eval('INSERT INTO parents (id) VALUES (1)')
+                    self:eval('INSERT INTO children (id, parent_id) VALUES (2, 1)')
+                end)
+            end)
+            local rows = db:eval('SELECT * FROM children')
+            return not ok, later_ok, #rows
+            "#,
+        )
+        .eval()
+        .expect("recover after failed transaction commit");
+
+    assert!(commit_failed, "the deferred foreign key must reject the commit");
+    assert!(
+        later_transaction_works,
+        "a failed commit must not leave an open transaction"
+    );
+    assert_eq!(child_count, 1, "the failed transaction must not persist");
+}
+
 // ============================================================================
 // 7. test_eval_escape_hatch (raw SQL with placeholders)
 // ============================================================================
