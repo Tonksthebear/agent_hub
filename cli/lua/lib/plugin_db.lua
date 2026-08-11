@@ -50,7 +50,12 @@ if not rawget(sqlite_defs, "__plugin_db_wrap_patched") then
     local in_user_tx = {}
     rawset(sqlite_defs, "__plugin_db_user_tx_set", in_user_tx)
     rawset(sqlite_defs, "wrap_stmts", function(conn_ptr, fn)
-        if in_user_tx[tostring(conn_ptr)] then
+        -- sqlite.lua can nest a table helper inside another table helper.
+        -- Its update fallback does this when it inserts a missing row. SQLite
+        -- reports zero from sqlite3_get_autocommit while any transaction is
+        -- active, so the outer helper must own commit and rollback.
+        if in_user_tx[tostring(conn_ptr)]
+            or sqlite_defs.get_autocommit(conn_ptr) == 0 then
             return fn()
         end
 

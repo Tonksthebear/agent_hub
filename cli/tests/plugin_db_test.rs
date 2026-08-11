@@ -585,6 +585,45 @@ fn failed_transaction_commit_rolls_back_and_connection_remains_usable() {
     assert_eq!(child_count, 1, "the failed transaction must not persist");
 }
 
+#[test]
+fn nested_table_update_insert_uses_the_outer_transaction() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "nested-update");
+
+    let (update_worked, row_name): (bool, String) = lua
+        .load(
+            r#"
+            local db = plugin.db{
+                memory = true,
+                version = 1,
+                models = {
+                    counters = {
+                        id = true,
+                        name = { 'text', required = true },
+                    },
+                },
+            }
+
+            local ok = pcall(function()
+                db.counters:update{
+                    where = { id = 7 },
+                    set = { name = 'created by update' },
+                }
+            end)
+            local row = db.counters:where{ id = 7 }
+            return ok, row and row.name or ''
+            "#,
+        )
+        .eval()
+        .expect("nested update insert");
+
+    assert!(update_worked, "the update fallback must support a nested insert");
+    assert_eq!(row_name, "created by update");
+}
+
 // ============================================================================
 // 7. test_eval_escape_hatch (raw SQL with placeholders)
 // ============================================================================
