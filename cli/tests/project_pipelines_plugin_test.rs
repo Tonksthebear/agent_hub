@@ -3729,7 +3729,7 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
                 return {{ id = id, title = "Child", target_id = "target-1" }}
               end,
               open_ticket_run = function() return nil end,
-              blocking_ticket_dependencies = function(ticket_id)
+              ticket_dependencies = function(ticket_id)
                 assert(ticket_id == "ticket-child")
                 return {{ {{ ticket_id = "ticket-child", depends_on_ticket_id = "ticket-parent", depends_on_title = "Parent", depends_on_status = "open" }} }}
               end,
@@ -3738,14 +3738,17 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
               end,
             }}
 
-            local ok, err = pcall(require("project_pipelines.engine").start_run, {{
+            local result = require("project_pipelines.engine").start_run({{
               ticket_id = "ticket-child",
               pipeline_id = "pipe-1",
               base_ref = "main",
             }})
 
-            assert(ok == false)
-            assert(tostring(err):find("ticket dependencies must close before starting a run: Parent (open)", 1, true))
+            assert(result.ok == false)
+            assert(result.status == "blocked")
+            assert(result.reason == "ticket_dependencies")
+            assert(result.source == "start_run")
+            assert(result.unmet_dependencies[1].depends_on_ticket_id == "ticket-parent")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
@@ -4751,7 +4754,7 @@ fn catalog_plugin_project_pipelines_start_run_rejects_archived_pipelines() {
                 return {{ id = id, target_id = "target-1", title = "Ticket" }}
               end,
               open_ticket_run = function() return nil end,
-              blocking_ticket_dependencies = function() return {{}} end,
+              ticket_dependencies = function() return {{}} end,
               get_pipeline = function(id)
                 if id == "archived" then
                   return {{ id = "archived", archived_at = 123 }}
