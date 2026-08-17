@@ -2129,7 +2129,7 @@ function M.start_run(params)
         ticket_id = params.ticket_id,
         pipeline_id = pipeline_id,
         parent_run_id = params.parent_run_id,
-        target_id = params.target_id or ticket.target_id,
+        target_id = ticket.target_id,
         workspace_id = params.workspace_id,
         workspace_name = params.workspace_name or ticket_workspace_name(ticket, params.ticket_id),
         base_ticket_id = base_attrs.base_ticket_id,

@@ -1220,7 +1220,7 @@ function M.register()
             target_id = target_id,
         }
         params.ticket_id = ticket.id
-        params.target_id = target_id
+        params.target_id = ticket.target_id
         params.workspace_id = params.workspace_id or parent.workspace_id
         params.workspace_name = params.workspace_name or parent.workspace_name
         params.base_ticket_id = params.base_ticket_id or parent.base_ticket_id

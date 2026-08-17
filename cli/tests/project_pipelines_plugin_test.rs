@@ -3418,6 +3418,138 @@ fn catalog_plugin_project_pipelines_start_run_ignores_cancelled_run() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_child_run_uses_created_ticket_target() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            mcp = {{
+              tool = function(name, _spec, handler) handlers[name] = handler end,
+              prompt = function() end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = setmetatable({{
+              prune_legacy_seed_data = function() end,
+              get_run = function(run_id)
+                assert(run_id == "run-parent")
+                return {{ id = run_id, ticket_id = "ticket-parent", target_id = "target-7001" }}
+              end,
+              create_ticket = function(attrs)
+                assert(attrs.target_id == "target-7002")
+                return {{ id = "ticket-child", target_id = "target-7002" }}
+              end,
+              append_event = function() end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+            package.loaded["project_pipelines.engine"] = setmetatable({{
+              start_run = function(params)
+                assert(params.ticket_id == "ticket-child")
+                assert(params.target_id == "target-7002")
+                return {{
+                  run = {{ id = "run-child", ticket_id = params.ticket_id, target_id = params.target_id }},
+                  activation = {{ ok = true }},
+                }}
+              end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+            package.loaded["project_pipelines.worktree_cleanup"] = {{
+              sweep_closed_tickets = function() return {{}} end,
+            }}
+            package.loaded["lib.config_resolver"] = {{
+              list_agents = function() return {{}} end,
+            }}
+
+            require("project_pipelines.mcp").register()
+            local result = handlers.project_pipelines_create_child_run({{
+              parent_run_id = "run-parent",
+              title = "Child",
+              target_id = "target-7002",
+            }})
+
+            assert(result.ok == true)
+            assert(result.result.ticket.target_id == "target-7002")
+            assert(result.result.run.target_id == result.result.ticket.target_id)
+            assert(result.result.run.target_id ~= "target-7001")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines child runs should use the created ticket target");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_start_run_uses_authoritative_ticket_target() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local run = nil
+            local step = {{ id = "step-1", kind = "command", name = "Check", command = "true" }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.worktree_cleanup"] = {{}}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{}}
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              get_ticket = function()
+                return {{ id = "ticket-child", target_id = "target-8102" }}
+              end,
+              open_ticket_run = function() return nil end,
+              ticket_dependencies = function() return {{}} end,
+              get_pipeline = function() return {{ id = "pipeline-1" }} end,
+              pipeline_steps = function() return {{ step }} end,
+              create_run = function(attrs)
+                assert(attrs.target_id == "target-8102")
+                assert(attrs.target_id ~= "target-8101")
+                run = attrs
+                run.id = "run-child"
+                return run
+              end,
+              next_step = function() error("stop_after_run_created") end,
+            }}
+
+            local ok, err = pcall(require("project_pipelines.engine").start_run, {{
+              ticket_id = "ticket-child",
+              pipeline_id = "pipeline-1",
+              target_id = "target-8101",
+            }})
+            assert(ok == false)
+            assert(tostring(err):find("stop_after_run_created", 1, true) ~= nil)
+            assert(run.target_id == "target-8102")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines start_run should use the authoritative ticket target");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_repo_publishes_targeted_entity_deltas() {
     let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
     let repo = std::fs::read_to_string(root.join("project_pipelines/repo.lua"))
