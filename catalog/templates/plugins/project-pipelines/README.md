@@ -94,6 +94,7 @@ Ticket and project MCP management:
 - `project_pipelines_add_project_target`
 - `project_pipelines_remove_project_target`
 - `project_pipelines_start_run`
+- `project_pipelines_cancel_run`
 
 Checklist MCP management:
 
@@ -200,6 +201,15 @@ it raises `ticket dependencies must close before starting a run: ...` before
 creating the run. A final advance with no target step still completes the run
 and follows its merge policy; dependency gating applies to target-step
 activation, not run completion or merge.
+
+`project_pipelines_cancel_run` changes an active or blocked run to the terminal
+`cancelled` status. The operation does not advance a step or request a merge.
+It preserves all run steps, plan artifacts, gate results, reviews, and run
+history. It appends a durable `run.cancelled` event and publishes the changed
+run and ticket entities through the repository mutation path. Repeating the
+operation for a cancelled run returns success without adding another event.
+A done run returns `reason = "run_already_done"` and remains unchanged. A new
+run can start for the same ticket because cancelled runs are not open runs.
 
 Closing or removing a dependency never activates work automatically. The
 operator must explicitly advance or retry again. A dependency added after the

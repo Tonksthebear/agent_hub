@@ -3215,6 +3215,209 @@ fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_pu
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_registers_cancel_run_tool() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            local specs = {{}}
+            mcp = {{
+              tool = function(name, spec, handler)
+                handlers[name] = handler
+                specs[name] = spec
+              end,
+              prompt = function() end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = setmetatable({{
+              prune_legacy_seed_data = function() end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+            package.loaded["project_pipelines.engine"] = setmetatable({{
+              cancel_run = function(params, context)
+                assert(params.run_id == "run-1")
+                assert(context.session_uuid == "sess-1")
+                return {{ ok = true, status = "cancelled" }}
+              end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+            package.loaded["project_pipelines.worktree_cleanup"] = {{
+              sweep_closed_tickets = function() return {{}} end,
+            }}
+            package.loaded["lib.config_resolver"] = {{
+              list_agents = function() return {{}} end,
+            }}
+
+            require("project_pipelines.mcp").register()
+
+            local spec = specs.project_pipelines_cancel_run
+            assert(spec ~= nil, "cancel_run tool must be registered")
+            assert(spec.input_schema.properties.run_id.type == "string")
+            assert(spec.input_schema.required[1] == "run_id")
+            assert(spec.description:find("already cancelled", 1, true) ~= nil)
+            assert(spec.description:find("run_already_done", 1, true) ~= nil)
+
+            local response = handlers.project_pipelines_cancel_run({{ run_id = "run-1" }}, {{ session_uuid = "sess-1" }})
+            assert(response.ok == true)
+            assert(response.result.status == "cancelled")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines should register the cancel-run MCP contract");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_cancels_runs_without_changing_history() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local run = {{
+              id = "run-1",
+              ticket_id = "ticket-1",
+              pipeline_id = "pipeline-1",
+              status = "active",
+              current_step_id = "step-1",
+              current_run_step_id = "visit-1",
+            }}
+            local updates = 0
+            local events = {{}}
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["project_pipelines.worktree_cleanup"] = {{}}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{}}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return run
+              end,
+              update_run = function(run_id, attrs)
+                assert(run_id == "run-1")
+                local count = 0
+                for key, value in pairs(attrs) do
+                  count = count + 1
+                  assert(key == "status" and value == "cancelled", "cancel must update only run status")
+                end
+                assert(count == 1)
+                updates = updates + 1
+                run.status = attrs.status
+                return run
+              end,
+              append_event = function(kind, attrs)
+                events[#events + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local cancelled = engine.cancel_run({{ run_id = "run-1" }}, {{ session_uuid = "sess-operator" }})
+            assert(cancelled.ok == true and cancelled.status == "cancelled")
+            assert(cancelled.already_cancelled == false)
+            assert(cancelled.run.current_step_id == "step-1")
+            assert(cancelled.run.current_run_step_id == "visit-1")
+            assert(updates == 1)
+            assert(#events == 1 and events[1].kind == "run.cancelled")
+            assert(events[1].attrs.run_id == "run-1")
+            assert(events[1].attrs.ticket_id == "ticket-1")
+            assert(events[1].attrs.payload.previous_status == "active")
+            assert(events[1].attrs.payload.cancelled_by_session_uuid == "sess-operator")
+
+            local repeated = engine.cancel_run({{ run_id = "run-1" }}, {{ session_uuid = "sess-operator" }})
+            assert(repeated.ok == true and repeated.already_cancelled == true)
+            assert(updates == 1, "idempotent cancellation must not write again")
+            assert(#events == 1, "idempotent cancellation must not append another event")
+
+            run.status = "done"
+            local done = engine.cancel_run({{ run_id = "run-1" }}, {{}})
+            assert(done.ok == false)
+            assert(done.status == "done")
+            assert(done.reason == "run_already_done")
+            assert(done.error == "done runs cannot be cancelled")
+            assert(run.status == "done")
+            assert(updates == 1 and #events == 1)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines should cancel runs without changing history");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_start_run_ignores_cancelled_run() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["project_pipelines.worktree_cleanup"] = {{}}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{}}
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              get_ticket = function()
+                return {{ id = "ticket-1", target_id = "target-1" }}
+              end,
+              open_ticket_run = function()
+                return {{ id = "run-cancelled", status = "cancelled" }}
+              end,
+              blocking_ticket_dependencies = function() return {{}} end,
+              closed_ticket_dependencies = function() return {{}} end,
+              ticket_dependencies = function() return {{}} end,
+              get_pipeline = function() return nil end,
+            }}
+
+            local ok, err = pcall(require("project_pipelines.engine").start_run, {{
+              ticket_id = "ticket-1",
+              pipeline_id = "pipeline-missing",
+            }})
+            assert(ok == false)
+            assert(tostring(err):find("pipeline not found: pipeline-missing", 1, true) ~= nil)
+            assert(tostring(err):find("already has an open run", 1, true) == nil)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines should not treat cancelled runs as open");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_repo_publishes_targeted_entity_deltas() {
     let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
     let repo = std::fs::read_to_string(root.join("project_pipelines/repo.lua"))

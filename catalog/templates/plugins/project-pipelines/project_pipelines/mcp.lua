@@ -656,6 +656,19 @@ function M.register()
         return sync_ok(engine.start_run(params))
     end)
 
+    tool("project_pipelines_cancel_run", {
+        description = "Cancel an active or blocked pipeline run without advancing its current step or requesting merge. Cancellation preserves run steps, reviews, gate results, and artifacts. Repeating cancellation for an already cancelled run is safe. A completed run returns a typed run_already_done result.",
+        input_schema = {
+            type = "object",
+            properties = {
+                run_id = { type = "string" },
+            },
+            required = { "run_id" },
+        },
+    }, function(params, context)
+        return sync_ok(engine.cancel_run(params, context))
+    end)
+
     tool("project_pipelines_request_merge", {
         description = "Spawn a merge agent for a ticket whose latest run is complete.",
         input_schema = {

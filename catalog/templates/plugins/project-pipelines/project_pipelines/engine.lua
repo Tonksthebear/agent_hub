@@ -2022,6 +2022,63 @@ function M.handle_pr_comment(link, event)
     return { ok = true, status = "recorded", reason = "no_steward", ticket = ticket, run = run }
 end
 
+function M.cancel_run(params, context)
+    util.assert_present(params.run_id, "run_id")
+
+    local run = repo.get_run(params.run_id)
+    if not run then
+        error("run not found: " .. tostring(params.run_id))
+    end
+
+    if run.status == "cancelled" then
+        return {
+            ok = true,
+            status = "cancelled",
+            already_cancelled = true,
+            run = run,
+        }
+    end
+
+    if run.status == "done" then
+        return {
+            ok = false,
+            status = "done",
+            reason = "run_already_done",
+            error = "done runs cannot be cancelled",
+            run = run,
+        }
+    end
+
+    if run.status ~= "active" and run.status ~= "blocked" then
+        return {
+            ok = false,
+            status = run.status,
+            reason = "run_not_cancellable",
+            error = "only active or blocked runs can be cancelled",
+            run = run,
+        }
+    end
+
+    local previous_status = run.status
+    local cancelled = repo.update_run(run.id, { status = "cancelled" })
+    repo.append_event("run.cancelled", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            previous_status = previous_status,
+            cancelled_by_session_uuid = context and context.session_uuid or nil,
+        },
+    })
+    refresh_surfaces(context)
+
+    return {
+        ok = true,
+        status = "cancelled",
+        already_cancelled = false,
+        run = cancelled,
+    }
+end
+
 function M.start_run(params)
     repo.prune_legacy_seed_data()
     local pipeline_id = params.pipeline_id
@@ -2035,7 +2092,7 @@ function M.start_run(params)
     end
     local ticket = repo.get_ticket(params.ticket_id)
     local open_run = repo.open_ticket_run(params.ticket_id)
-    if open_run then
+    if open_run and (open_run.status == "active" or open_run.status == "blocked") then
         error("ticket already has an open run: " .. tostring(open_run.id))
     end
     if util.is_blank(ticket.target_id) then
