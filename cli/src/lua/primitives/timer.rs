@@ -356,13 +356,15 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             let duration = duration_from_lua_seconds("timer.after", seconds)?;
 
             // Spawn a delivery task when an event sink is available.
+            // Plugin workers own plugin timer delivery. The Hub keeps a
+            // matching registration for ownership and reload cleanup only.
             let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
                 let cancel_flag = Arc::new(AtomicBool::new(false));
                 spawn_worker_timer_once(tx.clone(), id.clone(), duration, cancel_flag.clone());
                 cancel_flag
             });
             let task_handle = match (
-                cancel_flag.is_none(),
+                owner_plugin.is_none() && entries.worker_event_tx.is_none(),
                 &entries.hub_event_tx,
                 &entries.tokio_handle,
             ) {
@@ -424,13 +426,15 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             }
 
             // Spawn looping delivery task if an event sink is available.
+            // Plugin workers own plugin timer delivery. The Hub registration
+            // must not schedule a second copy on the central event loop.
             let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
                 let cancel_flag = Arc::new(AtomicBool::new(false));
                 spawn_worker_timer_repeating(tx.clone(), id.clone(), interval, cancel_flag.clone());
                 cancel_flag
             });
             let task_handle = match (
-                cancel_flag.is_none(),
+                owner_plugin.is_none() && entries.worker_event_tx.is_none(),
                 &entries.hub_event_tx,
                 &entries.tokio_handle,
             ) {
@@ -501,6 +505,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 // Refresh a single slot for this ID instead of appending a new
                 // cancelled entry every reset. Hot paths such as PTY idle
                 // detection call after_idle on nearly every output chunk.
+                // Plugin workers own plugin timer delivery. The Hub keeps the
+                // stable registration without a duplicate delivery task.
                 let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
                     let cancel_flag = Arc::new(AtomicBool::new(false));
                     spawn_worker_timer_once(tx.clone(), id.clone(), duration, cancel_flag.clone());
@@ -508,7 +514,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 });
 
                 let task_handle = match (
-                    cancel_flag.is_none(),
+                    owner_plugin.is_none() && entries.worker_event_tx.is_none(),
                     &entries.hub_event_tx,
                     &entries.tokio_handle,
                 ) {
@@ -710,6 +716,21 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
     // Phase 1: collect fired timers and clean up under the lock.
     let fired_timers: Vec<FiredTimer> = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
+
+        // Production runtimes use event-driven delivery. Polling those same
+        // entries would create a second delivery path for every timer.
+        if entries.hub_event_tx.is_some() || entries.worker_event_tx.is_some() {
+            let removed: Vec<_> = entries
+                .entries
+                .drain_filter_compat()
+                .into_iter()
+                .map(|(_, entry)| entry.callback_key)
+                .collect();
+            for key in removed {
+                let _ = lua.remove_registry_value(key);
+            }
+            return 0;
+        }
 
         // Collect callback keys for timers that should fire
         let mut fired = Vec::new();
@@ -1475,6 +1496,72 @@ mod tests {
             entries.entries[0].1.handler_id.as_deref(),
             Some("owned-plugin:timer_0")
         );
+    }
+
+    #[test]
+    fn plugin_owned_hub_timers_keep_registration_without_delivery_tasks() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        registry.lock().expect("mutex").set_event_channel(
+            crate::hub::events::HubEventTx::from(event_tx),
+            runtime.handle().clone(),
+        );
+        register(&lua, Arc::clone(&registry)).expect("register timers");
+
+        lua.load(
+            r#"
+            _G._loading_plugin_key = "owned-plugin"
+            timer.after(10, function() end)
+            timer.every(10, function() end)
+            timer.after_idle("owned:idle", 10, function() end)
+            _G._loading_plugin_key = nil
+            "#,
+        )
+        .exec()
+        .expect("register plugin timers");
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(entries.entries.len(), 3);
+        assert!(entries.entries.iter().all(|(_, entry)| {
+            entry.owner_plugin.as_deref() == Some("owned-plugin") && entry.task_handle.is_none()
+        }));
+    }
+
+    #[test]
+    fn event_driven_timers_do_not_fire_through_poll_fallback() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        registry.lock().expect("mutex").set_event_channel(
+            crate::hub::events::HubEventTx::from(event_tx),
+            runtime.handle().clone(),
+        );
+        register(&lua, Arc::clone(&registry)).expect("register timers");
+        lua.load(
+            r#"
+            fired_by_poll = false
+            timer.after(0, function() fired_by_poll = true end)
+            "#,
+        )
+        .exec()
+        .expect("register event-driven timer");
+
+        assert_eq!(poll_timers(&lua, &registry), 0);
+        assert!(!lua
+            .globals()
+            .get::<bool>("fired_by_poll")
+            .expect("read callback flag"));
     }
 
     #[test]

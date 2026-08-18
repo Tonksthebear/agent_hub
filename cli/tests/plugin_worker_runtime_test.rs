@@ -1120,8 +1120,8 @@ fn plugin_owned_timer_fires_after_delay_in_plugin_worker_vm() {
             local marker_path = {marker_path}
             timer.after(0.05, function()
                 local key = rawget(_G, "_plugin_worker_key")
-                local file = assert(io.open(marker_path, "w"))
-                file:write(key or "hub")
+                local file = assert(io.open(marker_path, "a"))
+                file:write((key or "hub") .. "\n")
                 file:close()
             end)
 
@@ -1152,8 +1152,10 @@ fn plugin_owned_timer_fires_after_delay_in_plugin_worker_vm() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
     let marker = fs::read_to_string(marker_path).expect("plugin worker timer marker");
-    assert_eq!(marker, "worker-timer-delay-plugin");
+    assert_eq!(marker, "worker-timer-delay-plugin\n");
 }
 
 #[test]

@@ -175,18 +175,16 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
 
         local timer_calls = { after_idle = 0, after = 0, cancel = 0 }
         local after_callbacks = {}
-        local after_idle_callbacks = {}
-        local after_idle_delays = {}
+        local after_delays = {}
         timer = {
-          after = function(_delay, fn)
+          after = function(delay, fn)
             timer_calls.after = timer_calls.after + 1
             after_callbacks[#after_callbacks + 1] = fn
+            after_delays[#after_delays + 1] = delay
             return "timer:osc_patch:" .. tostring(timer_calls.after)
           end,
-          after_idle = function(key, delay, fn)
+          after_idle = function(_key, _delay, _fn)
             timer_calls.after_idle = timer_calls.after_idle + 1
-            after_idle_delays[#after_idle_delays + 1] = delay
-            after_idle_callbacks[key] = fn
           end,
           every = function(_delay, _fn)
             return "timer:output_activity"
@@ -277,7 +275,7 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
         local after_same_value_timer_count = timer_calls.after
         hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "Done" })
         local rearmed_patch_count = #patches
-        after_idle_callbacks["session_osc_update:sess-title"]()
+        after_callbacks[2]()
         connections._before_reload()
 
         return {
@@ -293,7 +291,8 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
           sync_count = session.sync_count,
           sync_refresh_workspace_status = session.sync_refresh_workspace_status,
           after_idle_count = timer_calls.after_idle,
-          after_idle_delay = after_idle_delays[1],
+          patch_delay = after_delays[1],
+          manifest_delay = after_delays[2],
           after_count = timer_calls.after,
           after_same_value_timer_count = after_same_value_timer_count,
           cancel_count = timer_calls.cancel,
@@ -317,12 +316,13 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
     assert_eq!(result.get::<String>("reload_patch_title").unwrap(), "Done");
     assert_eq!(result.get::<i64>("sync_count").unwrap(), 1);
     assert!(!result.get::<bool>("sync_refresh_workspace_status").unwrap());
-    assert_eq!(result.get::<i64>("after_idle_count").unwrap(), 4);
-    assert_eq!(result.get::<f64>("after_idle_delay").unwrap(), 5.0);
-    assert_eq!(result.get::<i64>("after_count").unwrap(), 2);
+    assert_eq!(result.get::<i64>("after_idle_count").unwrap(), 0);
+    assert_eq!(result.get::<f64>("patch_delay").unwrap(), 0.2);
+    assert_eq!(result.get::<f64>("manifest_delay").unwrap(), 5.0);
+    assert_eq!(result.get::<i64>("after_count").unwrap(), 3);
     assert_eq!(
         result.get::<i64>("after_same_value_timer_count").unwrap(),
-        1
+        2
     );
     assert_eq!(result.get::<i64>("cancel_count").unwrap(), 3);
     assert_eq!(result.get::<i64>("publish_count").unwrap(), 2);
@@ -349,16 +349,16 @@ fn pty_title_changed_flushes_pending_manifest_sync_before_reload() {
 
         local timer_calls = { after_idle = 0, after = 0, cancel = 0 }
         local after_callbacks = {}
-        local after_idle_delays = {}
+        local after_delays = {}
         timer = {
-          after = function(_delay, fn)
+          after = function(delay, fn)
             timer_calls.after = timer_calls.after + 1
             after_callbacks[#after_callbacks + 1] = fn
+            after_delays[#after_delays + 1] = delay
             return "timer:osc_patch:" .. tostring(timer_calls.after)
           end,
-          after_idle = function(_key, delay, _fn)
+          after_idle = function(_key, _delay, _fn)
             timer_calls.after_idle = timer_calls.after_idle + 1
-            after_idle_delays[#after_idle_delays + 1] = delay
           end,
           every = function(_delay, _fn)
             return "timer:output_activity"
@@ -441,7 +441,8 @@ fn pty_title_changed_flushes_pending_manifest_sync_before_reload() {
           sync_count = session.sync_count,
           sync_refresh_workspace_status = session.sync_refresh_workspace_status,
           after_idle_count = timer_calls.after_idle,
-          after_idle_delay = after_idle_delays[1],
+          patch_delay = after_delays[1],
+          manifest_delay = after_delays[2],
           after_count = timer_calls.after,
           cancel_count = timer_calls.cancel,
         }
@@ -455,8 +456,9 @@ fn pty_title_changed_flushes_pending_manifest_sync_before_reload() {
     assert_eq!(result.get::<String>("title").unwrap(), "Reload Soon");
     assert_eq!(result.get::<i64>("sync_count").unwrap(), 1);
     assert!(!result.get::<bool>("sync_refresh_workspace_status").unwrap());
-    assert_eq!(result.get::<i64>("after_idle_count").unwrap(), 1);
-    assert_eq!(result.get::<f64>("after_idle_delay").unwrap(), 5.0);
-    assert_eq!(result.get::<i64>("after_count").unwrap(), 1);
-    assert!(result.get::<i64>("cancel_count").unwrap() >= 1);
+    assert_eq!(result.get::<i64>("after_idle_count").unwrap(), 0);
+    assert_eq!(result.get::<f64>("patch_delay").unwrap(), 0.2);
+    assert_eq!(result.get::<f64>("manifest_delay").unwrap(), 5.0);
+    assert_eq!(result.get::<i64>("after_count").unwrap(), 2);
+    assert!(result.get::<i64>("cancel_count").unwrap() >= 2);
 }

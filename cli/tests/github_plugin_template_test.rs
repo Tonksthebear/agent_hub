@@ -365,6 +365,77 @@ fn catalog_plugin_github_template_refreshes_routing_for_new_spawn_target_repo() 
 }
 
 #[test]
+fn catalog_plugin_github_template_caches_repo_inspection_until_targets_change() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ timer_cb = nil, inspect_count = 0, detect_count = 0 }}
+            local target_path = "/repos/one"
+            package.preload["mcp_proxy"] = function()
+              return {{ start = function() end, stop = function() end }}
+            end
+            package.preload["notifications"] = function()
+              return {{ register = function() end }}
+            end
+            package.preload["event_routing"] = function()
+              return {{ start = function() end, stop = function() end }}
+            end
+            hub = {{
+              detect_repo = function(path)
+                _G.__github_test.detect_count = _G.__github_test.detect_count + 1
+                if path then return path == "/repos/one" and "owner/one" or "owner/two" end
+                return "owner/current"
+              end,
+            }}
+            spawn_targets = {{
+              list = function()
+                return {{ {{ id = "target", path = target_path, enabled = true }} }}
+              end,
+              inspect = function(path)
+                _G.__github_test.inspect_count = _G.__github_test.inspect_count + 1
+                return {{ repo_name = path == "/repos/one" and "owner/one" or "owner/two" }}
+              end,
+            }}
+            timer = {{
+              every = function(_, cb) _G.__github_test.timer_cb = cb return "timer-1" end,
+              cancel = function() end,
+            }}
+            log = {{ info = function() end, warn = function() end }}
+
+            assert(loadfile({init_path}))()
+            _G.__github_test.timer_cb()
+            _G.__github_test.timer_cb()
+            local unchanged_inspect_count = _G.__github_test.inspect_count
+            local unchanged_detect_count = _G.__github_test.detect_count
+            target_path = "/repos/two"
+            _G.__github_test.timer_cb()
+            return {{
+              unchanged_inspect_count = unchanged_inspect_count,
+              unchanged_detect_count = unchanged_detect_count,
+              changed_inspect_count = _G.__github_test.inspect_count,
+              changed_detect_count = _G.__github_test.detect_count,
+            }}
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub plugin should cache unchanged spawn target inspection");
+
+    assert_eq!(result["unchanged_inspect_count"], json!(1));
+    assert_eq!(result["unchanged_detect_count"], json!(2));
+    assert_eq!(result["changed_inspect_count"], json!(2));
+    assert_eq!(result["changed_detect_count"], json!(3));
+}
+
+#[test]
 fn catalog_plugin_github_mcp_proxy_normalizes_create_pull_request_draft_false() {
     let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

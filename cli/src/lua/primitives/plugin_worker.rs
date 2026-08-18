@@ -713,18 +713,15 @@ fn wait_for_invoke_response(
         match response_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
             Ok(Ok(value)) => {
                 service_parent_requests(lua, parent_rx);
-                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
                 return Ok(value);
             }
             Ok(Err(err)) => {
                 service_parent_requests(lua, parent_rx);
-                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
                 return Err(anyhow!(err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 service_parent_requests(lua, parent_rx);
-                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
                 return Err(anyhow!("plugin worker response channel closed"));
             }
         }
