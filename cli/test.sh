@@ -19,6 +19,8 @@ fi
 RUN_UNIT=false
 RUN_INTEGRATION=false
 RUN_BUILD_CHECK=false
+RUN_VT_SEGV_MATRIX=false
+VT_SEGV_MATRIX_MODE=both
 CARGO_ARGS=""
 
 show_help() {
@@ -29,6 +31,8 @@ show_help() {
     echo "  --integration    Run integration tests only"
     echo "  --all, -a        Run all tests (default if no option given)"
     echo "  --check, -c      Just check compilation, don't run tests"
+    echo "  --vt-segv-matrix [pin|upstream|both]"
+    echo "                   Run the Ghostty VT SEGV matrix (default: both)"
     echo "  --help, -h       Show this help"
     echo ""
     echo "Any additional arguments are passed to cargo test."
@@ -65,6 +69,14 @@ while [[ $# -gt 0 ]]; do
             RUN_BUILD_CHECK=true
             shift
             ;;
+        --vt-segv-matrix)
+            RUN_VT_SEGV_MATRIX=true
+            shift
+            if [[ "${1:-}" =~ ^(pin|upstream|both)$ ]]; then
+                VT_SEGV_MATRIX_MODE="$1"
+                shift
+            fi
+            ;;
         --help|-h)
             show_help
             exit 0
@@ -83,7 +95,7 @@ done
 
 # If the caller supplied only cargo test filters/args, keep the documented
 # default behavior and run the full suite with those args.
-if [ "$RUN_UNIT" = false ] && [ "$RUN_INTEGRATION" = false ] && [ "$RUN_BUILD_CHECK" = false ]; then
+if [ "$RUN_UNIT" = false ] && [ "$RUN_INTEGRATION" = false ] && [ "$RUN_BUILD_CHECK" = false ] && [ "$RUN_VT_SEGV_MATRIX" = false ]; then
     RUN_UNIT=true
     RUN_INTEGRATION=true
 fi
@@ -104,6 +116,12 @@ if [ "$RUN_BUILD_CHECK" = true ]; then
     echo ""
     echo "Compilation OK"
     exit 0
+fi
+
+if [ "$RUN_VT_SEGV_MATRIX" = true ]; then
+    echo "Running Ghostty VT SEGV matrix ($VT_SEGV_MATRIX_MODE)..."
+    ./scripts/vt-segv-matrix.sh "$VT_SEGV_MATRIX_MODE"
+    echo ""
 fi
 
 if [ "$RUN_UNIT" = true ]; then

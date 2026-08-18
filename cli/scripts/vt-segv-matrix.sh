@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PIN_REMOTE="${VT_SEGV_PIN_REMOTE:-origin}"
-PIN_REF="${VT_SEGV_PIN_REF:-botster-vt-segv-fix}"
+PIN_REF="${VT_SEGV_PIN_REF:-eb72ec61304ea256be1d86ed8fa961c84e43ecbd}"
 UPSTREAM_URL="${VT_SEGV_UPSTREAM_URL:-https://github.com/ghostty-org/ghostty.git}"
 UPSTREAM_REF="${VT_SEGV_UPSTREAM_REF:-main}"
 
@@ -129,15 +129,15 @@ run_fixtures() {
   done
 
   echo ""
-  echo "Rust lib tests (same fixtures via cargo):"
+  echo "Rust library tests (same fixtures through cli/test.sh):"
   set +e
-  cargo test -q --lib botster_vt_ -- --test-threads=1
+  ./test.sh --unit -- botster_vt_ -- --test-threads=1
   local trc=$?
   set -e
   if [ "$trc" -eq 0 ]; then
-    echo "cargo botster_vt_*: GREEN"
+    echo "cli/test.sh botster_vt_*: GREEN"
   else
-    echo "cargo botster_vt_*: RED (exit $trc)"
+    echo "cli/test.sh botster_vt_*: RED (exit $trc)"
     fail=1
   fi
 
@@ -150,6 +150,11 @@ run_fixtures() {
 }
 
 ensure_pin_fetchable() {
+  if git -C "$VENDOR" cat-file -e "$PIN_REF^{commit}" 2>/dev/null; then
+    echo "==> using local pin $PIN_REF"
+    return
+  fi
+
   # Prefer trybotster remote name if present on the submodule.
   if git -C "$VENDOR" remote get-url trybotster >/dev/null 2>&1; then
     PIN_REMOTE=trybotster
@@ -182,7 +187,7 @@ UP_RC=0
 
 if [ "$MODE" = "pin" ] || [ "$MODE" = "both" ]; then
   ensure_pin_fetchable
-  PIN_SHA="$(git -C "$VENDOR" rev-parse "$PIN_REMOTE/$PIN_REF" 2>/dev/null || git -C "$VENDOR" rev-parse "FETCH_HEAD")"
+  PIN_SHA="$(git -C "$VENDOR" rev-parse "$PIN_REF" 2>/dev/null || git -C "$VENDOR" rev-parse "$PIN_REMOTE/$PIN_REF" 2>/dev/null || git -C "$VENDOR" rev-parse "FETCH_HEAD")"
   # Prefer explicit trybotster tip if fetch left FETCH_HEAD
   if git -C "$VENDOR" rev-parse -q --verify "trybotster/$PIN_REF" >/dev/null 2>&1; then
     PIN_SHA="$(git -C "$VENDOR" rev-parse "trybotster/$PIN_REF")"
