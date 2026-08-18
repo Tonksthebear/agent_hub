@@ -1553,6 +1553,7 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
               publish_snapshots = function() end,
             }}
             package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
               find_pr_link = function(attrs)
                 assert(attrs.provider == "github")
                 assert(attrs.repo == "owner/repo")
@@ -3714,6 +3715,7 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
             }}
 
             package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
               prune_legacy_seed_data = function() end,
               get_ticket = function(id)
                 assert(id == "ticket-1")
@@ -3870,6 +3872,7 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
             }}
 
             package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
               prune_legacy_seed_data = function() end,
               get_ticket = function(id) return ticket end,
               open_ticket_run = function() return nil end,
@@ -3968,6 +3971,7 @@ fn catalog_plugin_project_pipelines_start_run_explicit_base_ref_does_not_stack_o
 
             package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
             package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
               prune_legacy_seed_data = function() end,
               get_ticket = function(id) return tickets[id] end,
               open_ticket_run = function() return nil end,
@@ -4363,6 +4367,7 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
 
             package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
             package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
               get_run = function(run_id)
                 assert(run_id == "run-verify")
                 return run
@@ -4844,7 +4849,7 @@ fn catalog_plugin_project_pipelines_db_v10_migration_adds_nullable_pipeline_colu
             log = {{ warn = function() end }}
 
             require("project_pipelines.db")
-            assert(spec.version == 10)
+            assert(spec.version == 11)
             for _, column in ipairs({{ "version_label", "archived_at", "replacement_pipeline_id", "supersedes_pipeline_id" }}) do
               assert(spec.models.pipelines[column] ~= nil, "fresh model missing " .. column)
             end
@@ -4957,7 +4962,7 @@ fn catalog_plugin_project_pipelines_archive_schema_and_allowlists_are_wired() {
         std::fs::read_to_string(root.join("project_pipelines/entity_contract.lua"))
             .expect("read project pipelines entity contract");
 
-    assert!(db.contains("version = 10"));
+    assert!(db.contains("version = 11"));
     for column in [
         "version_label",
         "archived_at",
