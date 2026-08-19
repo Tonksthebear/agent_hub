@@ -190,15 +190,6 @@ class HubTest < ActiveSupport::TestCase
     assert_equal "a-very-long-hub-i...", hub.name
   end
 
-  test "e2e_enabled? always returns true" do
-    hub = Hub.new(
-      user: @user,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    assert hub.e2e_enabled?
-  end
-
   test "next_message_sequence! increments atomically" do
     hub = Hub.create!(
       user: @user,

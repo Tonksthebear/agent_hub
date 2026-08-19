@@ -145,6 +145,12 @@ pub fn is_offline() -> bool {
     std::env::var("BOTSTER_OFFLINE").as_deref() == Ok("1")
 }
 
+/// Returns `true` if WebRTC signaling and data-channel encryption are disabled.
+#[must_use]
+pub fn is_encryption_disabled() -> bool {
+    std::env::var("BOTSTER_DISABLE_ENCRYPTION").as_deref() == Ok("1")
+}
+
 /// Returns `true` if keyring should be bypassed (any test mode).
 ///
 /// Use this instead of `is_test_mode()` when deciding whether to use
@@ -254,6 +260,16 @@ mod tests {
             "is_offline should be false for values other than '1'"
         );
         std::env::remove_var("BOTSTER_OFFLINE");
+    }
+
+    #[test]
+    fn test_is_encryption_disabled_uses_explicit_flag_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BOTSTER_DISABLE_ENCRYPTION");
+        assert!(!is_encryption_disabled());
+        std::env::set_var("BOTSTER_DISABLE_ENCRYPTION", "1");
+        assert!(is_encryption_disabled());
+        std::env::remove_var("BOTSTER_DISABLE_ENCRYPTION");
     }
 
     // ── session_manifest_path fault injection ─────────────────────────────

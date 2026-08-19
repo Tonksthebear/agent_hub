@@ -162,7 +162,7 @@ pub(crate) struct WebRtcOfferRequest {
     pub(crate) hub_id: String,
     pub(crate) server_url: String,
     pub(crate) api_key: String,
-    pub(crate) crypto_service: crate::relay::CryptoService,
+    pub(crate) crypto_service: Option<crate::relay::CryptoService>,
     pub(crate) outgoing_signal_tx:
         tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     pub(crate) stream_frame_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::StreamIncoming>,
@@ -178,7 +178,7 @@ pub(crate) struct WebRtcOfferStart {
     pub(crate) generation: u64,
     pub(crate) channel: crate::channel::WebRtcChannel,
     pub(crate) config: crate::channel::ChannelConfig,
-    pub(crate) crypto_service: crate::relay::CryptoService,
+    pub(crate) crypto_service: Option<crate::relay::CryptoService>,
 }
 
 #[derive(Debug)]
@@ -186,7 +186,7 @@ pub(crate) struct WebRtcOfferCompletion {
     pub(crate) browser_identity: String,
     pub(crate) generation: u64,
     pub(crate) channel: crate::channel::WebRtcChannel,
-    pub(crate) encrypted_answer: Option<serde_json::Value>,
+    pub(crate) answer_signal: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -475,7 +475,7 @@ impl WebRtcTransportRunner {
         }
     }
 
-    /// Connect the WebRTC channel, process the browser offer, and encrypt the answer.
+    /// Connect the WebRTC channel and process the browser offer.
     pub(crate) async fn negotiate_offer(start: WebRtcOfferStart) -> WebRtcOfferCompletion {
         let WebRtcOfferStart {
             browser_identity,
@@ -486,18 +486,18 @@ impl WebRtcTransportRunner {
             crypto_service,
         } = start;
         let started_at = Instant::now();
-        let encrypted_answer = if let Err(error) = channel.connect(config).await {
+        let answer_signal = if let Err(error) = channel.connect(config).await {
             log::error!(
                 "[WebRTC] Failed to configure channel before offer handling after {}ms: {error}",
                 started_at.elapsed().as_millis()
             );
             None
         } else {
-            Self::handle_offer_and_encrypt_answer(
+            Self::handle_offer_and_build_answer(
                 &channel,
                 &browser_identity,
                 &sdp,
-                &crypto_service,
+                crypto_service.as_ref(),
                 started_at,
             )
             .await
@@ -507,15 +507,15 @@ impl WebRtcTransportRunner {
             browser_identity,
             generation,
             channel,
-            encrypted_answer,
+            answer_signal,
         }
     }
 
-    async fn handle_offer_and_encrypt_answer(
+    async fn handle_offer_and_build_answer(
         channel: &crate::channel::WebRtcChannel,
         browser_identity: &str,
         sdp: &str,
-        crypto_service: &crate::relay::CryptoService,
+        crypto_service: Option<&crate::relay::CryptoService>,
         started_at: Instant,
     ) -> Option<serde_json::Value> {
         let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
@@ -530,6 +530,9 @@ impl WebRtcTransportRunner {
                     "type": "answer",
                     "sdp": answer_sdp,
                 });
+                let Some(crypto_service) = crypto_service else {
+                    return Some(answer_payload);
+                };
                 let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
                 match crypto_service.lock() {
                     Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
@@ -944,15 +947,18 @@ impl WebRtcPeerRegistry {
         use crate::channel::{ChannelConfig, WebRtcChannel};
 
         let generation = self.next_offer_generation(&request.browser_identity);
-        let builder = WebRtcChannel::builder()
+        let mut builder = WebRtcChannel::builder()
             .server_url(&request.server_url)
             .api_key(&request.api_key)
             .signal_tx(request.outgoing_signal_tx)
             .stream_frame_tx(request.stream_frame_tx)
             .hub_event_tx(request.hub_event_tx)
-            .crypto_service(Arc::clone(&request.crypto_service))
             .pty_input_tx(request.pty_input_tx)
             .file_input_tx(request.file_input_tx);
+
+        if let Some(ref crypto_service) = request.crypto_service {
+            builder = builder.crypto_service(Arc::clone(crypto_service));
+        }
 
         let channel = builder.build();
         channel.set_offer_generation(generation);
@@ -960,7 +966,7 @@ impl WebRtcPeerRegistry {
             channel_name: "WebRtcChannel".to_string(),
             hub_id: request.hub_id,
             browser_identity: Some(request.browser_identity.clone()),
-            encrypt: true,
+            encrypt: request.crypto_service.is_some(),
             compression_threshold: Some(4096),
             cli_subscription: false,
         };
@@ -987,7 +993,7 @@ impl WebRtcPeerRegistry {
             browser_identity,
             generation,
             mut channel,
-            encrypted_answer,
+            answer_signal,
         } = completion;
         let current_generation = self.current_offer_generation(&browser_identity);
         if generation != current_generation {
@@ -1002,7 +1008,7 @@ impl WebRtcPeerRegistry {
             };
         }
 
-        let Some(envelope) = encrypted_answer else {
+        let Some(envelope) = answer_signal else {
             self.clear_offer_state(&browser_identity);
             let failed_browser_identity = browser_identity.clone();
             runtime.spawn(async move {
@@ -2112,7 +2118,7 @@ mod tests {
             hub_id: "hub-test".to_string(),
             server_url: "https://example.test".to_string(),
             api_key: "test-key".to_string(),
-            crypto_service: crate::relay::create_crypto_service("hub-test"),
+            crypto_service: Some(crate::relay::create_crypto_service("hub-test")),
             outgoing_signal_tx,
             stream_frame_tx,
             hub_event_tx: hub_event_tx.into(),
@@ -2348,6 +2354,23 @@ mod tests {
     }
 
     #[test]
+    fn start_offer_supports_plaintext_transport() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "anon:tab-1";
+        let mut request = test_offer_request(browser_identity);
+        request.crypto_service = None;
+
+        let start = registry.start_offer(request);
+
+        assert!(!start.config.encrypt);
+        assert!(start.crypto_service.is_none());
+        assert_eq!(
+            start.config.browser_identity.as_deref(),
+            Some(browser_identity)
+        );
+    }
+
+    #[test]
     fn failed_offer_completion_clears_inflight_state_for_retry() {
         let mut registry = WebRtcPeerRegistry::new();
         let browser_identity = "olm-key:tab-1";
@@ -2370,7 +2393,7 @@ mod tests {
                 browser_identity: browser_identity.to_string(),
                 generation,
                 channel: test_channel(),
-                encrypted_answer: None,
+                answer_signal: None,
             },
             &runtime,
         );
@@ -2839,7 +2862,7 @@ mod tests {
                 browser_identity: browser_identity.to_string(),
                 generation: first_generation,
                 channel: first_channel,
-                encrypted_answer: Some(serde_json::json!({"t": 1, "c": "stale"})),
+                answer_signal: Some(serde_json::json!({"t": 1, "c": "stale"})),
             },
             &runtime,
         );
@@ -2857,7 +2880,7 @@ mod tests {
                 browser_identity: browser_identity.to_string(),
                 generation: second_generation,
                 channel: test_channel(),
-                encrypted_answer: Some(serde_json::json!({"t": 1, "c": "current"})),
+                answer_signal: Some(serde_json::json!({"t": 1, "c": "current"})),
             },
             &runtime,
         );

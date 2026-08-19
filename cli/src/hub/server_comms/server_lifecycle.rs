@@ -104,6 +104,14 @@ impl Hub {
         let local_id = self.hub_identifier.clone();
         let server_url = self.config.server_url.clone();
 
+        if crate::env::is_encryption_disabled() {
+            let connection_url = format!("{server_url}/hubs/{server_hub_id}#no-encryption");
+            if let Err(error) = crate::relay::write_connection_url(&local_id, &connection_url) {
+                log::warn!("Failed to write connection URL: {error}");
+            }
+            return Ok(connection_url);
+        }
+
         registration::write_connection_url_lazy(
             &mut self.browser,
             &self.tokio_runtime,

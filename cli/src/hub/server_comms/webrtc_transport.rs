@@ -48,6 +48,17 @@ impl Hub {
             .unwrap_or("");
 
         match msg_type {
+            "transport_config_request" => {
+                if browser_identity.is_empty() {
+                    log::warn!("[Lua] transport_config_request missing browser_identity");
+                    return;
+                }
+                let config = serde_json::json!({
+                    "type": "transport_config",
+                    "e2e_enabled": !crate::env::is_encryption_disabled(),
+                });
+                self.emit_outgoing_signal(browser_identity, config, "transport config");
+            }
             "signal" => {
                 if browser_identity.is_empty() {
                     log::warn!("[Lua] Signal message missing browser_identity");
@@ -711,6 +722,17 @@ impl Hub {
             return;
         }
 
+        let encryption_disabled = crate::env::is_encryption_disabled();
+        let crypto_service = if encryption_disabled {
+            None
+        } else {
+            self.browser.crypto_service.clone()
+        };
+        if !encryption_disabled && crypto_service.is_none() {
+            log::error!("[WebRTC] Rejecting encrypted offer because crypto is not ready");
+            return;
+        }
+
         let hub_id = self.server_hub_id().to_string();
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
@@ -772,10 +794,6 @@ impl Hub {
             }
         }
 
-        let Some(crypto_service) = self.browser.crypto_service.clone() else {
-            log::error!("[WebRTC] No crypto service for encrypted answer");
-            return;
-        };
         let request = crate::worker::webrtc::WebRtcOfferRequest {
             browser_identity: browser_identity.to_string(),
             sdp: sdp.to_string(),
@@ -800,7 +818,7 @@ impl Hub {
         );
         let event_tx = self.hub_event_tx.clone();
 
-        // Spawn async task for SDP negotiation + answer encryption.
+        // Spawn an async task for SDP negotiation and optional answer encryption.
         self.tokio_runtime.spawn(async move {
             let completion =
                 crate::worker::webrtc::WebRtcTransportRunner::negotiate_offer(start).await;

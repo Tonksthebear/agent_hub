@@ -45,6 +45,7 @@ const MAX_PENDING_REMOTE_ICE = 128
 const ICE_CONFIG_CACHE_TTL_MS = 60_000
 const ICE_CONFIG_FETCH_TIMEOUT_MS = 3000
 const PEER_SETUP_TIMEOUT_MS = 15_000
+const TRANSPORT_CONFIG_FALLBACK_MS = 5_000
 const DIRECT_CHURN_WINDOW_MS = 60_000
 const DIRECT_CHURN_THRESHOLD = 1
 const RELAY_FALLBACK_MS = 5 * 60_000
@@ -133,6 +134,7 @@ class HubPeerConnection {
       this.#graceTimers.clear()
 
       for (const [hubId, conn] of this.#connections) {
+        clearTimeout(conn.transportConfigTimer)
         this.#peerLifecycle.teardownPeer(conn)
         this.#signalingClient.disconnect(hubId)
       }
@@ -174,11 +176,12 @@ class HubPeerConnection {
     }
   }
 
-  async connectSignaling(hubId, browserIdentity) {
+  async connectSignaling(hubId, browserIdentity, allowPlaintext = false) {
     this.#cancelGracePeriod(hubId)
 
     const existing = this.#connections.get(hubId)
     if (existing) {
+      existing.allowPlaintext ||= allowPlaintext
       this.#prefetchIceConfig(hubId, existing)
       this.#signalingClient.emitBrowserSocketStateForHub(hubId)
       if (existing.lastHealth) {
@@ -197,6 +200,7 @@ class HubPeerConnection {
       mode: ConnectionMode.UNKNOWN,
       hubId,
       browserIdentity,
+      allowPlaintext,
       subscriptions: new Map(),
       pendingCandidates: [],
       iceRestartAttempts: 0,
@@ -219,6 +223,9 @@ class HubPeerConnection {
       forceRelayUntil: 0,
       signalingConnected: true,
       lastHealth: null,
+      encryptionEnabled: null,
+      transportConfigPending: true,
+      transportConfigTimer: null,
     }
 
     this.#connections.set(hubId, conn)
@@ -287,6 +294,7 @@ class HubPeerConnection {
   async requestFreshBundle(hubId, timeoutMs = 5000) {
     const conn = this.#connections.get(hubId)
     if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
+    if (conn.encryptionEnabled === false) return { refreshed: false }
     if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
 
     const subscription = this.#signalingClient.getSubscription(hubId)
@@ -385,7 +393,7 @@ class HubPeerConnection {
     })
   }
 
-  async subscribe(hubId, channelName, params, providedSubscriptionId = null, encryptedBinary = null) {
+  async subscribe(hubId, channelName, params, providedSubscriptionId = null, plaintext = null) {
     const conn = this.#connections.get(hubId)
     if (!conn) throw new Error(`No connection for hub ${hubId}`)
 
@@ -398,14 +406,14 @@ class HubPeerConnection {
     await this.#waitForServerReady(hubId, conn)
     const subscribeStartedAt = performance.now()
 
-    if (!encryptedBinary) {
-      console.error("[WebRTCTransport] subscribe called without encrypted payload")
-      throw new Error("Cannot subscribe without encrypted payload")
+    if (!plaintext) {
+      throw new Error("Cannot subscribe without a payload")
     }
 
     const confirmed = this.#channelProtocol.waitForSubscriptionConfirmed(subscriptionId)
     try {
-      conn.dataChannel.send(encryptedBinary.buffer)
+      const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+      conn.dataChannel.send(wire.buffer)
     } catch (error) {
       this.#channelProtocol.clearPendingSubscription(subscriptionId)
       conn.subscriptions.delete(subscriptionId)
@@ -426,10 +434,10 @@ class HubPeerConnection {
       if (conn.dataChannel?.readyState === "open") {
         try {
           const plaintext = buildControlFrame({ type: "unsubscribe", subscriptionId })
-          const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-          conn.dataChannel.send(encrypted.buffer)
+          const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+          conn.dataChannel.send(wire.buffer)
         } catch (error) {
-          console.warn("[WebRTCTransport] Failed to encrypt unsubscribe:", error)
+          console.warn("[WebRTCTransport] Failed to send unsubscribe:", error)
         }
       }
 
@@ -449,22 +457,23 @@ class HubPeerConnection {
       }
 
       const plaintext = buildControlFrame({ subscriptionId, data: message })
-      const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-      conn.dataChannel.send(encrypted.buffer)
+      const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+      conn.dataChannel.send(wire.buffer)
       return { sent: true }
     }
 
     throw new Error(`Subscription ${subscriptionId} not found`)
   }
 
-  async sendEncrypted(hubId, encrypted) {
+  async sendData(hubId, plaintext) {
     const conn = this.#connections.get(hubId)
     if (!conn) throw new Error(`No connection for hub ${hubId}`)
     if (conn.dataChannel?.readyState !== "open") {
       throw new Error("DataChannel not open")
     }
 
-    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+    const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+    conn.dataChannel.send(wire.buffer)
     return { sent: true }
   }
 
@@ -482,8 +491,8 @@ class HubPeerConnection {
     plaintext[3] = streamId & 0xFF
     if (payload?.length) plaintext.set(payload, 4)
 
-    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+    const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+    conn.dataChannel.send(wire.buffer)
   }
 
   async sendPtyInput(hubId, subscriptionId, data) {
@@ -502,8 +511,8 @@ class HubPeerConnection {
     plaintext.set(subIdBytes, 3)
     plaintext.set(dataBytes, 3 + subIdBytes.length)
 
-    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+    const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+    conn.dataChannel.send(wire.buffer)
 
     if (conn.dataChannel.bufferedAmount > 4096) {
       const now = Date.now()
@@ -540,8 +549,8 @@ class HubPeerConnection {
     const chunkLimit = Math.max(maxMessageSize - 256, 16384)
 
     if (plaintext.length <= chunkLimit) {
-      const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-      conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+      const wire = await this.#encodeDataChannelFrame(hubId, plaintext)
+      conn.dataChannel.send(wire.buffer)
       return
     }
 
@@ -575,8 +584,8 @@ class HubPeerConnection {
           chunk.set(fileData.slice(pos, end), 3)
         }
 
-        const { data: encrypted } = await bridge.encryptBinary(String(hubId), chunk)
-        conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+        const wire = await this.#encodeDataChannelFrame(hubId, chunk)
+        conn.dataChannel.send(wire.buffer)
         pos = end
       }
     } finally {
@@ -633,6 +642,7 @@ class HubPeerConnection {
     if (!conn) return
 
     console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
+    clearTimeout(conn.transportConfigTimer)
     this.#handlePeerLost(hubId, PEER_LOST_REASONS.GRACE_EXPIRED)
     this.#signalingClient.disconnect(hubId)
     this.#connections.delete(hubId)
@@ -858,7 +868,11 @@ class HubPeerConnection {
       },
       onState: (state) => {
         const conn = this.#connections.get(hubId)
-        if (conn) conn.signalingConnected = state === "connected"
+        if (!conn) return
+        conn.signalingConnected = state === "connected"
+        if (state === "connected") {
+          this.#markTransportConfigPending(hubId, conn)
+        }
       },
     })
   }
@@ -867,11 +881,50 @@ class HubPeerConnection {
     if (data.type === "health") {
       const conn = this.#connections.get(hubId)
       if (conn) conn.lastHealth = data
+      if (data.cli === "offline" && conn) {
+        this.#markTransportConfigPending(hubId, conn, false)
+      } else if (data.cli === "online" && conn?.transportConfigPending) {
+        this.#signalingClient.getSubscription(hubId)?.perform("request_transport_config", {})
+        this.#scheduleTransportConfigFallback(hubId, conn)
+      }
       this.#emit("health", { hubId, ...data })
       return
     }
 
     if (data.type !== "signal") return
+
+    if (data.envelope?.type === "transport_config") {
+      const conn = this.#connections.get(hubId)
+      if (!conn?.transportConfigPending) return
+      clearTimeout(conn.transportConfigTimer)
+      conn.transportConfigTimer = null
+      const nextEncryptionEnabled = data.envelope.e2e_enabled !== false
+      if (!nextEncryptionEnabled && !conn.allowPlaintext) {
+        conn.transportConfigPending = false
+        this.#emit("transport:config", {
+          hubId,
+          e2e_enabled: null,
+          error: "plaintext_opt_in_required",
+        })
+        return
+      }
+
+      const previousEncryptionEnabled = conn.encryptionEnabled
+      conn.transportConfigPending = false
+      conn.encryptionEnabled = nextEncryptionEnabled
+      if (
+        typeof previousEncryptionEnabled === "boolean" &&
+        previousEncryptionEnabled !== nextEncryptionEnabled &&
+        conn.pc
+      ) {
+        this.#handlePeerLost(hubId, "transport_config_changed")
+      }
+      this.#emit("transport:config", {
+        hubId,
+        e2e_enabled: conn.encryptionEnabled,
+      })
+      return
+    }
 
     if (data.envelope?.t === 2 && data.envelope?.b) {
       console.debug("[WebRTCTransport] Received bundle refresh from CLI via ActionCable")
@@ -917,6 +970,9 @@ class HubPeerConnection {
   }
 
   async #decryptSignalEnvelope(hubId, envelope) {
+    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
+      return envelope
+    }
     try {
       const { plaintext } = await bridge.decrypt(String(hubId), envelope)
       return typeof plaintext === "string" ? JSON.parse(plaintext) : plaintext
@@ -927,8 +983,42 @@ class HubPeerConnection {
   }
 
   async #encryptSignal(hubId, payload) {
+    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
+      return payload
+    }
     const { encrypted } = await bridge.encrypt(String(hubId), payload)
     return encrypted
+  }
+
+  async #encodeDataChannelFrame(hubId, plaintext) {
+    const bytes = plaintext instanceof Uint8Array ? plaintext : new Uint8Array(plaintext)
+    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
+      return bytes
+    }
+    const { data } = await bridge.encryptBinary(String(hubId), bytes)
+    return data instanceof Uint8Array ? data : new Uint8Array(data)
+  }
+
+  #markTransportConfigPending(hubId, conn, scheduleFallback = true) {
+    clearTimeout(conn.transportConfigTimer)
+    conn.transportConfigTimer = null
+    conn.transportConfigPending = true
+    this.#emit("transport:config", { hubId, e2e_enabled: null })
+    if (scheduleFallback) this.#scheduleTransportConfigFallback(hubId, conn)
+  }
+
+  #scheduleTransportConfigFallback(hubId, conn) {
+    if (conn.transportConfigTimer || !conn.transportConfigPending) return
+    conn.transportConfigTimer = setTimeout(() => {
+      conn.transportConfigTimer = null
+      if (!conn.transportConfigPending) return
+      conn.encryptionEnabled ??= true
+      this.#emit("transport:config", {
+        hubId,
+        e2e_enabled: conn.encryptionEnabled,
+        fallback: true,
+      })
+    }, TRANSPORT_CONFIG_FALLBACK_MS)
   }
 }
 

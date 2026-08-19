@@ -1,7 +1,7 @@
 //! WebRTC DataChannel implementation.
 //!
 //! This module provides `WebRtcChannel`, an implementation of the `Channel`
-//! trait that communicates via WebRTC DataChannel with E2E encryption.
+//! trait that communicates through a WebRTC DataChannel with optional E2E encryption.
 //!
 //! # Architecture
 //!
@@ -9,16 +9,16 @@
 //! WebRtcChannel
 //!     |-- PeerConnection (rustrtc)
 //!     |-- DataChannel (SCTP - reliable ordered, no message size limit)
-//!     |-- E2E encryption (via CryptoService = Arc<Mutex<VodozemacCrypto>>)
+//!     |-- Optional E2E encryption (via CryptoService = Arc<Mutex<VodozemacCrypto>>)
 //!     |-- Gzip compression (via compression module)
-//!     `-- Signaling via ActionCable (encrypted envelopes)
+//!     `-- Signaling via ActionCable
 //! ```
 //!
 //! # Key Differences from ActionCable
 //!
 //! - No custom reliable delivery needed (SCTP provides it natively)
 //! - Peer-to-peer when possible, TURN relay as fallback
-//! - Signaling (offer/answer/ICE) via ActionCable, E2E encrypted
+//! - Signaling (offer/answer/ICE) via ActionCable, with optional E2E encryption
 
 use async_trait::async_trait;
 use mdns_sd::{HostnameResolutionEvent, ScopedIp, ServiceDaemon};
@@ -350,7 +350,7 @@ impl WebRtcChannelBuilder {
 
 /// WebRTC DataChannel-based channel implementation.
 ///
-/// Provides E2E encrypted communication via WebRTC with SCTP reliable delivery.
+/// Provides WebRTC communication with SCTP reliable delivery and optional E2E encryption.
 #[derive(Clone)]
 pub struct WebRtcChannel {
     /// Server URL for signaling.
@@ -1274,10 +1274,8 @@ impl Drop for MdnsResolveCleanup {
 
 #[cfg(test)]
 mod tests {
-    use super::WebRtcChannel;
-    use mdns_sd::ScopedIp;
-    use std::collections::HashSet;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[tokio::test]
     async fn rewrite_hostname_candidate_to_ip_skips_numeric_addresses() {
@@ -1331,6 +1329,38 @@ mod tests {
             WebRtcChannel::select_mdns_ip(&addresses),
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         );
+    }
+
+    #[tokio::test]
+    async fn plaintext_control_frame_routes_without_crypto() {
+        let payload = br#"{"type":"subscribe"}"#;
+        let mut frame = vec![CONTENT_MSG];
+        frame.extend_from_slice(payload);
+        let (recv_tx, mut recv_rx) = mpsc::channel(1);
+        let recv_tx = Arc::new(Mutex::new(Some(recv_tx)));
+        let peers = Arc::new(RwLock::new(HashSet::new()));
+        let decrypt_failures = Arc::new(AtomicU32::new(0));
+        let mut chunk_assemblies = HashMap::new();
+
+        handle_dc_message(
+            &frame,
+            "anon:tab-1",
+            &None,
+            &decrypt_failures,
+            &recv_tx,
+            &peers,
+            &None,
+            &None,
+            &None,
+            &None,
+            &mut chunk_assemblies,
+        )
+        .await;
+
+        let incoming = recv_rx.recv().await.expect("plaintext control frame");
+        assert_eq!(incoming.payload, payload);
+        assert_eq!(incoming.sender.as_ref(), "anon:tab-1");
+        assert!(peers.read().await.contains(&PeerId("anon:tab-1".into())));
     }
 }
 
@@ -1402,26 +1432,13 @@ impl Channel for WebRtcChannel {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
-        let peer_key = self.get_peer_olm_key().await?;
-
         // Binary inner: [0x00][JSON bytes] (control message)
         let mut plaintext = Vec::with_capacity(1 + msg.len());
         plaintext.push(CONTENT_MSG);
         plaintext.extend_from_slice(msg);
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        // Encrypt → binary frame (no base64, no JSON)
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
-
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1529,13 +1546,16 @@ impl WebRtcChannel {
     /// With vodozemac, the session is established on first PreKey decrypt --
     /// no separate handshake needed.
     pub fn is_ready(&self) -> bool {
+        if self.crypto_service.is_none() {
+            return true;
+        }
         self.crypto_service
             .as_ref()
             .and_then(|cs| cs.lock().ok())
             .is_some_and(|guard| guard.has_session())
     }
 
-    /// Send PTY output via the hot path: compress → binary frame → Olm → wire.
+    /// Send PTY output through the hot path with optional Olm encryption.
     ///
     /// Zero base64, zero JSON. Binary inner format:
     /// `[0x01][flags:1][sub_id_len:1][sub_id][raw payload]`
@@ -1556,19 +1576,12 @@ impl WebRtcChannel {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
         // Compress raw bytes (gzip is very effective on terminal output)
         let config_guard = self.config.lock().await;
         let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
         let (payload, was_compressed) = pty_payload_with_compression(data, threshold)?;
-
-        let peer_key = self.get_peer_olm_key().await?;
 
         // Build binary inner content: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
         let sub_bytes = subscription_id.as_bytes();
@@ -1580,21 +1593,16 @@ impl WebRtcChannel {
         plaintext.extend_from_slice(sub_bytes);
         plaintext.extend_from_slice(&payload);
 
-        // Encrypt → binary frame (no base64, no JSON)
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
         Ok(())
     }
 
-    /// Send a stream multiplexer frame via encrypted DataChannel.
+    /// Send a stream multiplexer frame through the DataChannel.
     ///
     /// Binary format: `[CONTENT_STREAM][frame_type][stream_id_hi][stream_id_lo][payload]`
     pub async fn send_stream_raw(
@@ -1615,13 +1623,6 @@ impl WebRtcChannel {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
-        let peer_key = self.get_peer_olm_key().await?;
-
         let stream_id_bytes = stream_id.to_be_bytes();
         let mut plaintext = Vec::with_capacity(4 + payload.len());
         plaintext.push(CONTENT_STREAM);
@@ -1629,13 +1630,9 @@ impl WebRtcChannel {
         plaintext.extend_from_slice(&stream_id_bytes);
         plaintext.extend_from_slice(payload);
 
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1669,6 +1666,18 @@ impl WebRtcChannel {
 
         Ok(())
     }
+
+    async fn encode_data_channel_frame(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
+        let Some(ref crypto_service) = self.crypto_service else {
+            return Ok(plaintext);
+        };
+        let peer_key = self.get_peer_olm_key().await?;
+        crypto_service
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext, &peer_key)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))
+    }
 }
 
 /// Lightweight, cloneable send handle for a [`WebRtcChannel`].
@@ -1700,7 +1709,7 @@ impl std::fmt::Debug for WebRtcSender {
 }
 
 impl WebRtcSender {
-    /// Send PTY output: compress, encrypt, send via DataChannel.
+    /// Compress and send PTY output with optional encryption.
     ///
     /// Same logic as [`WebRtcChannel::send_pty_raw`] but operates on the
     /// extracted Arc fields so it can run in a spawned task.
@@ -1720,18 +1729,11 @@ impl WebRtcSender {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
         let config_guard = self.config.lock().await;
         let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
         let (payload, was_compressed) = pty_payload_with_compression(data, threshold)?;
-
-        let peer_key = self.get_peer_olm_key().await?;
 
         let sub_bytes = subscription_id.as_bytes();
         let flags: u8 = if was_compressed { 0x01 } else { 0x00 };
@@ -1742,27 +1744,23 @@ impl WebRtcSender {
         plaintext.extend_from_slice(sub_bytes);
         plaintext.extend_from_slice(&payload);
 
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
         Ok(())
     }
 
-    /// Send a JSON message: serialize, encrypt, send via DataChannel.
+    /// Serialize and send a JSON message with optional encryption.
     ///
     /// Same logic as [`WebRtcChannel::send_to`] but for the extracted handle.
     pub async fn send_json(&self, payload: &[u8]) -> Result<(), ChannelError> {
         self.send_message_raw(payload).await
     }
 
-    /// Send a raw `CONTENT_MSG` payload via encrypted DataChannel.
+    /// Send a raw `CONTENT_MSG` payload through the DataChannel.
     pub async fn send_message_raw(&self, payload: &[u8]) -> Result<(), ChannelError> {
         let pc_guard = self.peer_connection.lock().await;
         let pc = pc_guard
@@ -1775,32 +1773,21 @@ impl WebRtcSender {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
-        let peer_key = self.get_peer_olm_key().await?;
-
         // Wrap in CONTENT_MSG frame: [0x00][json bytes]
         let mut plaintext = Vec::with_capacity(1 + payload.len());
         plaintext.push(CONTENT_MSG);
         plaintext.extend_from_slice(payload);
 
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
         Ok(())
     }
 
-    /// Send a stream multiplexer frame via encrypted DataChannel.
+    /// Send a stream multiplexer frame through the DataChannel.
     pub async fn send_stream_raw(
         &self,
         frame_type: u8,
@@ -1818,11 +1805,6 @@ impl WebRtcSender {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self.crypto_service.as_ref().ok_or_else(|| {
-            ChannelError::EncryptionError("No crypto service for stream send".to_string())
-        })?;
-        let peer_key = self.get_peer_olm_key().await?;
-
         let stream_id_bytes = stream_id.to_be_bytes();
         let mut plaintext = Vec::with_capacity(4 + payload.len());
         plaintext.push(CONTENT_STREAM);
@@ -1830,13 +1812,9 @@ impl WebRtcSender {
         plaintext.extend_from_slice(&stream_id_bytes);
         plaintext.extend_from_slice(payload);
 
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        let wire = self.encode_data_channel_frame(plaintext).await?;
 
-        pc.send_data(dc_id, &encrypted)
+        pc.send_data(dc_id, &wire)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1875,6 +1853,18 @@ impl WebRtcSender {
             .clone()
             .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key set".into()))
     }
+
+    async fn encode_data_channel_frame(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
+        let Some(ref crypto_service) = self.crypto_service else {
+            return Ok(plaintext);
+        };
+        let peer_key = self.get_peer_olm_key().await?;
+        crypto_service
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext, &peer_key)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))
+    }
 }
 
 impl WebRtcChannel {
@@ -1910,27 +1900,27 @@ async fn handle_dc_message(
     hub_event_tx: &Option<crate::hub::events::HubEventTx>,
     chunk_assemblies: &mut std::collections::HashMap<u8, FileChunkAssembly>,
 ) {
-    let Some(ref cs) = crypto_service else {
-        log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
-        return;
-    };
-    let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
-    let plaintext = match cs.lock() {
-        Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
-            Ok(pt) => {
-                decrypt_failures.store(0, Ordering::Relaxed);
-                pt
-            }
+    let plaintext = if let Some(ref cs) = crypto_service {
+        let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
+        match cs.lock() {
+            Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
+                Ok(pt) => {
+                    decrypt_failures.store(0, Ordering::Relaxed);
+                    pt
+                }
+                Err(e) => {
+                    decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                    log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
+                    return;
+                }
+            },
             Err(e) => {
-                decrypt_failures.fetch_add(1, Ordering::Relaxed);
-                log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
+                log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
                 return;
             }
-        },
-        Err(e) => {
-            log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
-            return;
         }
+    } else {
+        data.to_vec()
     };
 
     // Parse binary inner content: first byte = content type

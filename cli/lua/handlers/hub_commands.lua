@@ -5,7 +5,7 @@
 --   - Routes command messages to Lua event system
 --   - Acks commands by sequence number
 --   - Sends application-level heartbeat every 30s (agent status sync)
---   - Relays outgoing WebRTC signals through encrypted ActionCable pipe
+--   - Relays outgoing WebRTC signals through ActionCable
 --
 -- NOTE: ActionCable protocol pings are handled automatically by the
 -- action_cable primitive (Rust). The 30s heartbeat here is application-
@@ -68,7 +68,7 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
     function(message, channel_id)
         local msg_type = message.type
 
-        if msg_type == "signal" or msg_type == "bundle_request" then
+        if msg_type == "signal" or msg_type == "bundle_request" or msg_type == "transport_config_request" then
             hub.handle_signaling_message(message)
         elseif msg_type == "message" then
             local event_type = message.event_type or ""
@@ -165,7 +165,7 @@ if handles.signal_event_sub then
     events.off(handles.signal_event_sub)
 end
 
--- Relay outgoing WebRTC signals (pre-encrypted by Rust) through ActionCable
+-- Relay outgoing WebRTC signals through ActionCable. Rust encrypts them when enabled.
 handles.signal_event_sub = events.on("outgoing_signal", function(data)
     if handles.channel then
         action_cable.perform(handles.channel, "signal", data)

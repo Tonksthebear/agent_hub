@@ -78,8 +78,18 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     end
   end
 
-  test "subscribe does not request a bundle for anonymous browsers" do
-    assert_broadcasts("hub_command:#{@hub.id}", 0) do
+  test "subscribe requests transport config from the live hub" do
+    assert_broadcast_on("hub_command:#{@hub.id}", {
+      type: "transport_config_request",
+      browser_identity: @browser_identity
+    }) do
+      subscribe hub_id: @hub.id, browser_identity: @browser_identity
+    end
+  end
+
+
+  test "anonymous subscribe requests config but not a bundle" do
+    assert_broadcasts("hub_command:#{@hub.id}", 1) do
       subscribe hub_id: @hub.id, browser_identity: "anon:test-tab"
     end
 
@@ -149,6 +159,17 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
       browser_identity: @browser_identity
     }) do
       perform :request_bundle
+    end
+  end
+
+  test "request_transport_config relays a config request to the live hub" do
+    subscribe hub_id: @hub.id, browser_identity: @browser_identity
+
+    assert_broadcast_on("hub_command:#{@hub.id}", {
+      type: "transport_config_request",
+      browser_identity: @browser_identity
+    }) do
+      perform :request_transport_config
     end
   end
 

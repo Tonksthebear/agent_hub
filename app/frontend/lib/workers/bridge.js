@@ -94,6 +94,7 @@ class WorkerBridge {
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
       webrtcTransport.on("subscription:ready", (data) => this.#dispatchEvent({ event: "subscription:ready", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
+      webrtcTransport.on("transport:config", (data) => this.#dispatchEvent({ event: "transport:config", ...data }))
       webrtcTransport.on("browser:state", (data) => this.#dispatchEvent({ event: "browser:state", ...data }))
       webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))
       webrtcTransport.on("session:refreshed", (data) => this.#dispatchEvent({ event: "session:refreshed", ...data }))
@@ -269,7 +270,11 @@ class WorkerBridge {
       case "connect":
         return webrtcTransport.connect(params.hubId, params.browserIdentity)
       case "connectSignaling":
-        return webrtcTransport.connectSignaling(params.hubId, params.browserIdentity)
+        return webrtcTransport.connectSignaling(
+          params.hubId,
+          params.browserIdentity,
+          params.allowPlaintext,
+        )
       case "connectPeer":
         return webrtcTransport.connectPeer(params.hubId)
       case "awaitFreshBundle":
@@ -295,15 +300,14 @@ class WorkerBridge {
         plaintext[0] = 0x00  // CONTENT_MSG
         plaintext.set(jsonBytes, 1)
 
-        const { data: encrypted } = await this.encryptBinary(params.hubId, plaintext)
-        return webrtcTransport.subscribe(params.hubId, params.channel, params.params, params.subscriptionId, encrypted)
+        return webrtcTransport.subscribe(params.hubId, params.channel, params.params, params.subscriptionId, plaintext)
       }
       case "unsubscribe":
         return webrtcTransport.unsubscribe(params.subscriptionId)
       case "sendRaw":
         return webrtcTransport.sendRaw(params.subscriptionId, params.message)
-      case "sendEncrypted":
-        return webrtcTransport.sendEncrypted(params.hubId, params.encrypted)
+      case "sendData":
+        return webrtcTransport.sendData(params.hubId, params.plaintext)
       case "sendStreamFrame":
         return webrtcTransport.sendStreamFrame(params.hubId, params.frameType, params.streamId, params.payload)
       case "sendPtyInput":
@@ -311,14 +315,13 @@ class WorkerBridge {
       case "sendFileInput":
         return webrtcTransport.sendFileInput(params.hubId, params.subscriptionId, params.data, params.filename)
       case "sendControlMessage": {
-        // Send arbitrary JSON control message via encrypted DataChannel
+        // Send an arbitrary JSON control message through the DataChannel.
         const jsonBytes = new TextEncoder().encode(JSON.stringify(params.message))
         const plaintext = new Uint8Array(1 + jsonBytes.length)
         plaintext[0] = 0x00  // CONTENT_MSG
         plaintext.set(jsonBytes, 1)
 
-        const { data: encrypted } = await this.encryptBinary(params.hubId, plaintext)
-        return webrtcTransport.sendEncrypted(params.hubId, encrypted)
+        return webrtcTransport.sendData(params.hubId, plaintext)
       }
       default:
         throw new Error(`Unknown action: ${action}`)

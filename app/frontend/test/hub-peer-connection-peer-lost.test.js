@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => {
   const subscriptions = {
-    create: vi.fn(() => ({
+    create: vi.fn((_params, callbacks) => ({
       perform: vi.fn(),
       unsubscribe: vi.fn(),
+      ...callbacks,
     })),
   }
 
@@ -24,7 +25,7 @@ const mocks = vi.hoisted(() => {
     bridge: {
       createSession: vi.fn(),
       decryptBinary: vi.fn(),
-      encryptBinary: vi.fn(),
+      encryptBinary: vi.fn((_hubId, data) => Promise.resolve({ data })),
       decrypt: vi.fn(),
       encrypt: vi.fn(() => Promise.resolve({ encrypted: { t: 1, b: "signal" } })),
     },
@@ -108,6 +109,8 @@ describe("HubPeerConnection peer lost transitions", () => {
     }))
     mocks.subscriptions.create.mockClear()
     mocks.bridge.encrypt.mockClear()
+    mocks.bridge.encryptBinary.mockClear()
+    mocks.bridge.decryptBinary.mockClear()
 
     ;({ HubPeerConnection } = await import("../lib/transport/hub_peer_connection"))
     transport = new HubPeerConnection()
@@ -170,6 +173,108 @@ describe("HubPeerConnection peer lost transitions", () => {
       peerReadyMs: expect.any(Number),
     })
     expect(connectedEvents()[0].peerReadyMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it("uses plaintext signaling and data after the health handshake disables encryption", async () => {
+    await transport.connectSignaling("hub-plain", "anon:tab", true)
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: false },
+    })
+
+    await transport.connectPeer("hub-plain")
+    const pc = MockRTCPeerConnection.instances.at(-1)
+
+    expect(mocks.bridge.encrypt).not.toHaveBeenCalled()
+    expect(subscription.perform).toHaveBeenCalledWith("signal", {
+      envelope: { type: "offer", sdp: "offer-sdp" },
+    })
+
+    pc.dataChannel.readyState = "open"
+    pc.dataChannel.onmessage({ data: encodeControlMessage({ type: "dc_ready" }) })
+    await flushPromises()
+
+    const subscribe = transport.subscribe(
+      "hub-plain",
+      "terminal",
+      {},
+      "sub-plain",
+      encodeControlMessage({
+        type: "subscribe",
+        subscriptionId: "sub-plain",
+        channel: "terminal",
+        params: {},
+      }),
+    )
+    await flushPromises()
+    pc.dataChannel.onmessage({
+      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-plain" }),
+    })
+
+    await expect(subscribe).resolves.toEqual({ subscriptionId: "sub-plain" })
+    expect(mocks.bridge.encryptBinary).not.toHaveBeenCalled()
+    expect(mocks.bridge.decryptBinary).not.toHaveBeenCalled()
+  })
+
+  it("requires fresh transport config after signaling reconnects", async () => {
+    const configs = []
+    transport.on("transport:config", (event) => configs.push(event))
+    await transport.connectSignaling("hub-config", "browser-identity", true)
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: false },
+    })
+    subscription.connected()
+
+    expect(configs).toEqual([
+      { hubId: "hub-config", e2e_enabled: false },
+      { hubId: "hub-config", e2e_enabled: null },
+    ])
+  })
+
+  it("rejects plaintext mode for a paired browser without explicit opt-in", async () => {
+    const configs = []
+    transport.on("transport:config", (event) => configs.push(event))
+    await transport.connectSignaling("hub-paired", "browser-identity")
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: false },
+    })
+
+    expect(configs.at(-1)).toEqual({
+      hubId: "hub-paired",
+      e2e_enabled: null,
+      error: "plaintext_opt_in_required",
+    })
+    expect(MockRTCPeerConnection.instances).toHaveLength(0)
+  })
+
+  it("tears down the peer when a pending transport mode changes", async () => {
+    await transport.connectSignaling("hub-change", "browser-identity", true)
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: false },
+    })
+    await transport.connectPeer("hub-change")
+    const pc = MockRTCPeerConnection.instances.at(-1)
+
+    subscription.connected()
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: true },
+    })
+
+    expect(pc.close).toHaveBeenCalledOnce()
+    expect(disconnectedEvents().at(-1)).toMatchObject({
+      hubId: "hub-change",
+      reason: "transport_config_changed",
+    })
   })
 
   it("emits subscription-ready timing after data channel subscribe ack", async () => {

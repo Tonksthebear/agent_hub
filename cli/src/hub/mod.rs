@@ -713,7 +713,11 @@ impl Hub {
         }
 
         if !offline {
-            self.init_crypto_service();
+            if crate::env::is_encryption_disabled() {
+                log::warn!("WebRTC encryption is disabled");
+            } else {
+                self.init_crypto_service();
+            }
             self.init_web_push();
         } else {
             log::info!("Offline mode: skipping crypto service and web push initialization");
@@ -1190,11 +1194,10 @@ impl Hub {
         }
     }
 
-    /// Generate connection URL, lazily generating bundle if needed.
+    /// Generate a connection URL and add a pairing bundle when encryption is enabled.
     ///
-    /// Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
-    /// - URL portion: byte mode (any case allowed)
-    /// - Bundle (after #): alphanumeric mode (uppercase Base32)
+    /// Encrypted format: `{server_url}/hubs/{id}/pairing#{base32_binary_bundle}`
+    /// Plaintext format: `{server_url}/hubs/{id}#no-encryption`
     ///
     /// On first call, this generates the PreKeyBundle (lazy initialization).
     /// Subsequent calls return the cached bundle unless it was used (in which

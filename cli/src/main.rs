@@ -387,6 +387,9 @@ enum Commands {
         /// no browser relay). Requires a previously authenticated device.
         #[arg(long)]
         offline: bool,
+        /// Disable WebRTC signaling and data-channel encryption.
+        #[arg(long)]
+        no_encryption: bool,
     },
     Status,
     Config {
@@ -1268,10 +1271,18 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Start { headless, offline } => {
+        Commands::Start {
+            headless,
+            offline,
+            no_encryption,
+        } => {
             if offline {
                 std::env::set_var("BOTSTER_OFFLINE", "1");
                 log::info!("Offline mode enabled — all network primitives disabled");
+            }
+            if no_encryption {
+                std::env::set_var("BOTSTER_DISABLE_ENCRYPTION", "1");
+                log::warn!("WebRTC encryption disabled by --no-encryption");
             }
             // Strict singleton policy: one live hub per device-local hub ID.
             //
@@ -1283,6 +1294,10 @@ fn main() -> Result<()> {
                 let pid_alive = botster::hub::daemon::is_hub_running(&id);
                 (id, socket, pid_alive)
             });
+
+            if no_encryption && existing_hub.as_ref().is_some_and(|(_, _, alive)| *alive) {
+                anyhow::bail!("A Hub is already running. Stop it before you use --no-encryption.");
+            }
 
             if headless {
                 if let Some((hub_id, Some(socket), _)) = existing_hub.as_ref() {

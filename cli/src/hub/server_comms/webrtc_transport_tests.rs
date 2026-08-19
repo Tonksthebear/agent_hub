@@ -1084,7 +1084,7 @@ pub(super) fn test_webrtc_peer_cleanup_removes_terminal_client_worker() {
             browser_identity: browser_identity.to_string(),
             generation,
             channel,
-            encrypted_answer: Some(serde_json::json!({"type": "answer"})),
+            answer_signal: Some(serde_json::json!({"type": "answer"})),
         },
         &hub.tokio_runtime,
     );
@@ -1187,7 +1187,7 @@ pub(super) fn test_failed_webrtc_offer_completion_records_start_failed_metric() 
         browser_identity: browser_identity.to_string(),
         generation,
         channel,
-        encrypted_answer: None,
+        answer_signal: None,
     });
 
     let snapshot = hub.hub_event_metrics.snapshot();

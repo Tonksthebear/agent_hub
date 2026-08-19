@@ -153,19 +153,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_operator hub.last_seen_at, :>, old_last_seen
   end
 
-  test "PUT /hubs/:id returns e2e_enabled status" do
-    hub = hubs(:active_hub)
-
-    put hub_url(hub),
-      params: {}.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :ok
-    json = assert_json_response
-
-    assert json.key?("e2e_enabled")
-  end
-
   test "PUT /hubs/:id returns 404 for other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-user-hub-#{SecureRandom.hex(4)}",

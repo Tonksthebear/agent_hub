@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => {
       sendCalls.push([type, payload]);
       if (type === "connectSignaling") {
         queueMicrotask(() => {
+          bridge.emit("transport:config", { hubId: payload.hubId, e2e_enabled: true });
           bridge.emit("health", { hubId: payload.hubId, cli: "online" });
         });
         return Promise.resolve({
@@ -51,11 +52,30 @@ const mocks = vi.hoisted(() => {
       listeners.clear();
       subscriptionListeners.clear();
       sendCalls.length = 0;
-      bridge.hasPairing.mockClear();
+      bridge.hasPairing.mockReset();
+      bridge.hasPairing.mockResolvedValue({ hasPairing: true });
       bridge.getIdentityKey.mockClear();
       bridge.hasSession.mockClear();
       bridge.encryptBinary.mockClear();
-      bridge.send.mockClear();
+      bridge.send.mockReset();
+      bridge.send.mockImplementation((type, payload) => {
+        sendCalls.push([type, payload]);
+        if (type === "connectSignaling") {
+          queueMicrotask(() => {
+            bridge.emit("transport:config", { hubId: payload.hubId, e2e_enabled: true });
+            bridge.emit("health", { hubId: payload.hubId, cli: "online" });
+          });
+          return Promise.resolve({
+            state: "connected",
+            browserSocketState: "connected",
+            mode: "direct",
+          });
+        }
+        if (type === "probePeerHealth") {
+          return Promise.resolve({ alive: true, pcState: "connected", dcState: "open" });
+        }
+        return Promise.resolve({});
+      });
       bridge.on.mockClear();
       bridge.onSubscriptionMessage.mockClear();
       bridge.clearSubscriptionListeners.mockClear();
@@ -103,6 +123,7 @@ describe("HubRoute peer health probes", () => {
     mocks.bridge.reset();
     document.body.innerHTML = "";
     window.localStorage.clear();
+    window.location.hash = "";
 
     ({ HubRoute } = await import("../lib/connections/hub_route"));
     TestHubRoute = class TestHubRoute extends HubRoute {
@@ -151,6 +172,67 @@ describe("HubRoute peer health probes", () => {
 
     expect(disconnectPeerCalls()).toHaveLength(0);
     expect(route.subscriptionId).toBe("hub:hub-1");
+  });
+
+  it("connects an unpaired browser when the live hub disables encryption", async () => {
+    route.destroy();
+    route = null;
+    mocks.bridge.reset();
+    mocks.bridge.hasPairing.mockResolvedValue({ hasPairing: false });
+    window.location.hash = "#no-encryption";
+    mocks.bridge.send.mockImplementation((type, payload) => {
+      mocks.bridge.sendCalls.push([type, payload]);
+      if (type === "connectSignaling") {
+        queueMicrotask(() => {
+          mocks.bridge.emit("transport:config", {
+            hubId: payload.hubId,
+            e2e_enabled: false,
+          });
+          mocks.bridge.emit("health", { hubId: payload.hubId, cli: "online" });
+        });
+        return Promise.resolve({
+          state: "connected",
+          browserSocketState: "connected",
+          mode: "direct",
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    route = new TestHubRoute("hub-1", { hubId: "hub-1" }, manager);
+    await route.initialize();
+    await flushPromises();
+
+    expect(mocks.bridge.sendCalls).toContainEqual([
+      "connectSignaling",
+      {
+        hubId: "hub-1",
+        browserIdentity: expect.stringMatching(/^anon:/),
+        allowPlaintext: true,
+      },
+    ]);
+    expect(mocks.bridge.sendCalls.some(([type]) => type === "connectPeer")).toBe(true);
+    expect(mocks.bridge.hasSession).not.toHaveBeenCalled();
+  });
+
+  it("passes the Hub connection URL plaintext opt-in to the transport", async () => {
+    route.destroy();
+    route = null;
+    mocks.bridge.reset();
+    window.location.hash = "#no-encryption";
+
+    route = new TestHubRoute("hub-1", { hubId: "hub-1" }, manager);
+    await route.initialize();
+    await flushPromises();
+
+    expect(mocks.bridge.sendCalls).toContainEqual([
+      "connectSignaling",
+      {
+        hubId: "hub-1",
+        browserIdentity: expect.any(String),
+        allowPlaintext: true,
+      },
+    ]);
   });
 
   it("rebuilds after repeated missed encrypted pongs while local peer is open", async () => {
@@ -248,6 +330,7 @@ describe("HubRoute peer health probes", () => {
       mocks.bridge.sendCalls.push([type, payload]);
       if (type === "connectSignaling") {
         queueMicrotask(() => {
+          mocks.bridge.emit("transport:config", { hubId: payload.hubId, e2e_enabled: true });
           mocks.bridge.emit("health", { hubId: payload.hubId, cli: "online" });
         });
         return Promise.resolve({

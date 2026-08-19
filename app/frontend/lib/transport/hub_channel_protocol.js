@@ -112,7 +112,10 @@ export class HubChannelProtocol {
 
       const raw = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data)
 
-      if (raw.length > 0 && raw[0] === MSG_TYPE_BUNDLE_REFRESH) {
+      const conn = this.#callbacks.getConnection(hubId)
+      const encryptionEnabled = conn?.encryptionEnabled !== false
+
+      if (encryptionEnabled && raw.length > 0 && raw[0] === MSG_TYPE_BUNDLE_REFRESH) {
         const bundleBytes = raw.slice(1)
         console.debug("[WebRTCTransport] Received bundle refresh from CLI via DataChannel")
         try {
@@ -128,19 +131,22 @@ export class HubChannelProtocol {
         return
       }
 
-      if (raw.length > 0 && raw[0] <= 0x01) {
+      if (raw.length > 0) {
         let plaintext
-        try {
-          const result = await this.#callbacks.decryptBinary(hubId, raw)
-          plaintext = result.data
+        if (!encryptionEnabled) {
+          plaintext = raw
+        } else {
+          try {
+            const result = await this.#callbacks.decryptBinary(hubId, raw)
+            plaintext = result.data
 
-          if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+            if (!this.#isCurrentPeerGeneration(hubId, generation)) return
 
-          const conn = this.#callbacks.getConnection(hubId)
-          if (conn) conn.decryptFailures = 0
-        } catch (error) {
-          console.error("[WebRTCTransport] Olm decryption failed:", error.message || error)
-          return
+            if (conn) conn.decryptFailures = 0
+          } catch (error) {
+            console.error("[WebRTCTransport] Olm decryption failed:", error.message || error)
+            return
+          }
         }
 
         if (!plaintext || plaintext.length === 0) return
@@ -172,7 +178,6 @@ export class HubChannelProtocol {
         return
       }
 
-      console.warn("[WebRTCTransport] Unexpected non-Olm message on DataChannel, dropping")
     } catch (error) {
       console.error("[WebRTCTransport] Failed to handle message:", error)
     }

@@ -27,11 +27,6 @@ class Hub < ApplicationRecord
   after_update_commit :broadcast_health_status, if: :health_status_changed?
   after_destroy_commit :broadcast_health_offline
 
-  # Check if this hub supports E2E encrypted terminal access
-  def e2e_enabled?
-    true
-  end
-
   # Check if this hub is active (alive flag set and seen within 2 minutes)
   def active?
     alive? && last_seen_at > 2.minutes.ago

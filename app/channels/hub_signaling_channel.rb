@@ -36,6 +36,14 @@ class HubSignalingChannel < ApplicationCable::Channel
     # Immediately tell browser current CLI status
     transmit(HealthStatus.message(@hub.active? ? HealthStatus::ONLINE : HealthStatus::OFFLINE))
 
+    # Ask the live Hub for its transport mode. The server only relays the reply.
+    if @hub.active?
+      ActionCable.server.broadcast(
+        "hub_command:#{@hub.id}",
+        { type: "transport_config_request", browser_identity: @browser_identity }
+      )
+    end
+
     # Paired browsers connect signaling with their long-term identity key.
     # Ask the CLI for a fresh signed bundle right away so the first offer can
     # use a new session without an extra browser-request round trip.
@@ -69,6 +77,15 @@ class HubSignalingChannel < ApplicationCable::Channel
     ActionCable.server.broadcast(
       "hub_command:#{@hub.id}",
       { type: "bundle_request", browser_identity: @browser_identity }
+    )
+  end
+
+  def request_transport_config(_data = nil)
+    return unless @hub
+
+    ActionCable.server.broadcast(
+      "hub_command:#{@hub.id}",
+      { type: "transport_config_request", browser_identity: @browser_identity }
     )
   end
 end

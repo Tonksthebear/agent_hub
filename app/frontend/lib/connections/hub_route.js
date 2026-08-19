@@ -11,6 +11,7 @@ const SESSION_TIMEOUT_MS = 5000;
 const PEER_PROBE_TIMEOUT_MS = 1500;
 const PEER_PROBE_COOLDOWN_MS = 1000;
 const PEER_PROBE_MISSED_PONG_LIMIT = 3;
+const PLAINTEXT_OPT_IN_FRAGMENT = "#no-encryption";
 
 const HEALTH_STATUS_MAP = {
   offline: CliStatus.OFFLINE,
@@ -51,6 +52,8 @@ export class HubRoute {
     this.subscriptionId = null;
     this.identityKey = null;
     this.browserIdentity = null;
+    this.plaintextAllowed = window.location.hash === PLAINTEXT_OPT_IN_FRAGMENT;
+    this.encryptionEnabled = null;
     this.state = ConnectionState.DISCONNECTED;
     this.browserSocketState = "disconnected";
     this.cliStatus = CliStatus.UNKNOWN;
@@ -102,6 +105,7 @@ export class HubRoute {
     this.subscriptionId = null;
     this.identityKey = null;
     this.browserIdentity = null;
+    this.encryptionEnabled = null;
     this.#hubConnected = false;
     this.#signalingConnected = false;
     this.browserSocketState = "disconnected";
@@ -179,7 +183,7 @@ export class HubRoute {
     if (!message?.type) return false;
 
     if (message.type === "connected") {
-      this.#sendEncrypted({ type: "ack", timestamp: Date.now() }).catch(() => {});
+      this.#sendData({ type: "ack", timestamp: Date.now() }).catch(() => {});
       return true;
     }
 
@@ -188,7 +192,7 @@ export class HubRoute {
     }
 
     if (message.type === "dc_ping") {
-      this.#sendEncrypted({ type: "dc_pong" }).catch(() => {});
+      this.#sendData({ type: "dc_pong" }).catch(() => {});
       return true;
     }
 
@@ -214,7 +218,7 @@ export class HubRoute {
    * Send a client command envelope through the active subscription.
    *
    * This is intentionally transport-only on the browser side: the command is
-   * encrypted, tagged with the route subscription, and delivered to
+   * framed, tagged with the route subscription, and delivered to
    * cli/lua/lib/client.lua for dispatch. Browser code must not own a parallel
    * command path.
    */
@@ -223,7 +227,7 @@ export class HubRoute {
     if (!this.subscriptionId) return false;
 
     try {
-      await this.#sendEncrypted({ type, ...data });
+      await this.#sendData({ type, ...data });
       return true;
     } catch (error) {
       console.error(`[${this.constructor.name}] Send failed:`, error);
@@ -242,7 +246,7 @@ export class HubRoute {
     if (!this.subscriptionId) return false;
 
     try {
-      await this.#sendEncrypted({ type, ...data });
+      await this.#sendData({ type, ...data });
       return true;
     } catch (error) {
       console.error(`[${this.constructor.name}] Telemetry send failed:`, error);
@@ -371,6 +375,35 @@ export class HubRoute {
           this.#setState(ConnectionState.CLI_DISCONNECTED);
         }
       }),
+      bridge.on("transport:config", (event) => {
+        if (event.hubId !== hubId) return;
+        if (event.error === "plaintext_opt_in_required") {
+          this.encryptionEnabled = null;
+          this.errorCode = event.error;
+          this.errorReason = "Open the no-encryption connection URL to allow plaintext transport";
+          this.lastError = this.errorReason;
+          this.emit("error", { reason: this.errorCode, message: this.errorReason });
+          return;
+        }
+        if (typeof event.e2e_enabled !== "boolean") {
+          this.encryptionEnabled = null;
+          return;
+        }
+        this.encryptionEnabled = event.e2e_enabled !== false;
+        if (!this.encryptionEnabled && this.errorCode === "unpaired") {
+          this.errorCode = null;
+          this.errorReason = null;
+          this.lastError = null;
+        }
+        if (this.encryptionEnabled && !this.identityKey) {
+          this.errorCode = "unpaired";
+          this.errorReason = "Scan connection code";
+          this.lastError = this.errorReason;
+          this.emit("error", { reason: this.errorCode, message: this.errorReason });
+          return;
+        }
+        this.#ensureConnected().catch(() => {});
+      }),
       bridge.on("connection:state", (event) => {
         if (event.hubId !== hubId) return;
         if (event.state === "connected") {
@@ -485,6 +518,7 @@ export class HubRoute {
     const result = await bridge.send("connectSignaling", {
       hubId: this.getHubId(),
       browserIdentity: this.browserIdentity,
+      allowPlaintext: this.plaintextAllowed,
     });
 
     this.#hubConnected = true;
@@ -501,7 +535,8 @@ export class HubRoute {
     if (this.#idle) return;
     if (this.errorCode === "session_invalid") return;
     if (!this.#hubConnected) return;
-    if (!this.identityKey) return;
+    if (this.encryptionEnabled === null) return;
+    if (this.encryptionEnabled && !this.identityKey) return;
     // WebRTC is gated only by the raw browser->Rails socket plus live hub
     // health. If both are ready, attempt the peer even if prior callbacks were
     // delayed or missed.
@@ -629,7 +664,7 @@ export class HubRoute {
     });
 
     try {
-      await this.#sendEncrypted({ type: "dc_ping", timestamp: Date.now() });
+      await this.#sendData({ type: "dc_ping", timestamp: Date.now() });
     } catch (error) {
       this.#resolvePeerProbe(false);
       return false;
@@ -663,6 +698,8 @@ export class HubRoute {
   }
 
   async #ensureActiveSession() {
+    if (!this.encryptionEnabled) return true;
+
     if (this.#sessionPending) {
       return this.#sessionPending;
     }
@@ -831,7 +868,7 @@ export class HubRoute {
     }
   }
 
-  async #sendEncrypted(message) {
+  async #sendData(message) {
     if (!this.subscriptionId) {
       throw new Error("No subscription");
     }
@@ -846,8 +883,7 @@ export class HubRoute {
     plaintext[0] = 0x00;
     plaintext.set(jsonBytes, 1);
 
-    const { data: encrypted } = await bridge.encryptBinary(this.getHubId(), plaintext);
-    await bridge.send("sendEncrypted", { hubId: this.getHubId(), encrypted });
+    await bridge.send("sendData", { hubId: this.getHubId(), plaintext });
   }
 
   #scheduleReconnect() {

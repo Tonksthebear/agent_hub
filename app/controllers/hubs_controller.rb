@@ -98,7 +98,7 @@ class HubsController < ApplicationController
     Current.hub.fingerprint = params[:fingerprint] if params[:fingerprint].present?
 
     if Current.hub.save
-      render json: { success: true, hub_id: Current.hub.id, e2e_enabled: Current.hub.e2e_enabled? }
+      render json: { success: true, hub_id: Current.hub.id }
     else
       render json: { error: Current.hub.errors.full_messages.join(", ") }, status: :unprocessable_entity
     end
