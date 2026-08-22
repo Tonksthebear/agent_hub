@@ -924,8 +924,7 @@ function constrainGlyphBox(glyph, constraint, metrics, constraintWidth) {
       heightFactor = Math.max(1, singleScale);
       widthFactor = heightFactor;
     }
-  } else if (sizeMode === "stretch") {
-  } else {
+  } else if (sizeMode === "stretch") {} else {
     widthFactor = 1;
     heightFactor = 1;
   }
@@ -10781,13 +10780,18 @@ class MouseController {
   button = 0;
   flags = { 1000: false, 1002: false, 1003: false };
   x10Event = false;
+  pendingWheelPx = 0;
   sendReply;
   positionToCell;
   positionToPixel;
+  getCellHeight;
+  getRows;
   constructor(options) {
     this.sendReply = options.sendReply;
     this.positionToCell = options.positionToCell;
     this.positionToPixel = options.positionToPixel;
+    this.getCellHeight = options.getCellHeight ?? (() => 20);
+    this.getRows = options.getRows ?? (() => 24);
   }
   setReplySink(fn) {
     this.sendReply = fn;
@@ -10808,6 +10812,7 @@ class MouseController {
       this.enabled = false;
       this.format = "x10";
       this.motion = "none";
+      this.pendingWheelPx = 0;
     } else {
       this.enabled = this.x10Event || this.flags[1000] || this.flags[1002] || this.flags[1003];
       if (this.flags[1003])
@@ -10866,6 +10871,7 @@ class MouseController {
     this.enabled = false;
     this.pressed = false;
     this.button = 0;
+    this.pendingWheelPx = 0;
     const bit = (n) => (bits & 1 << n) !== 0;
     this.x10Event = bit(0);
     this.flags[1000] = bit(1);
@@ -10895,6 +10901,8 @@ class MouseController {
       this.motion = "drag";
     else
       this.motion = "none";
+    if (!this.enabled)
+      this.pendingWheelPx = 0;
   }
   isActive() {
     if (this.mode === "off")
@@ -10942,17 +10950,30 @@ class MouseController {
       return this.sendMouse(code, col, row, pixel, false);
     }
     if (kind === "wheel") {
-      const steps = wheelReportSteps(event);
-      if (steps === 0)
+      const cellH = Math.max(1, this.getCellHeight() || 20);
+      const rows = Math.max(1, this.getRows() || 24);
+      const dyPx = wheelDeltaPixels(event, cellH, rows);
+      if (!dyPx)
         return false;
-      const codeBase = steps < 0 ? 64 : 65;
-      const n = Math.abs(steps);
-      let sent = false;
-      for (let i = 0;i < n; i += 1) {
-        if (this.sendMouse(codeBase + mods, col, row, pixel, false))
-          sent = true;
+      let next = this.pendingWheelPx;
+      if (next !== 0 && Math.sign(next) !== Math.sign(dyPx))
+        next = 0;
+      next += dyPx;
+      if (Math.abs(next) < cellH) {
+        this.pendingWheelPx = next;
+        return true;
       }
-      return sent;
+      const rawSteps = Math.trunc(next / cellH);
+      if (!rawSteps) {
+        this.pendingWheelPx = next;
+        return true;
+      }
+      const n = Math.abs(rawSteps);
+      const code = (rawSteps < 0 ? 64 : 65) + mods;
+      if (!this.sendWheelBatch(code, col, row, pixel, n))
+        return false;
+      this.pendingWheelPx = next - Math.sign(rawSteps) * n * cellH;
+      return true;
     }
     return false;
   }
@@ -10980,49 +11001,57 @@ class MouseController {
     return mod;
   }
   sendMouse(code, col, row, pixel, release) {
+    const seq = this.encodeMouse(code, col, row, pixel, release);
+    if (!seq)
+      return false;
+    this.sendReply(seq);
+    return true;
+  }
+  sendWheelBatch(code, col, row, pixel, count) {
+    if (count <= 0)
+      return false;
+    const one = this.encodeMouse(code, col, row, pixel, false);
+    if (!one)
+      return false;
+    this.sendReply(count === 1 ? one : one.repeat(count));
+    return true;
+  }
+  encodeMouse(code, col, row, pixel, release) {
     if (this.format === "x10") {
       if (col > 223 || row > 223)
-        return false;
+        return null;
       const cb = 32 + code;
       const cx = 32 + col;
       const cy = 32 + row;
-      this.sendReply(`\x1B[M${String.fromCharCode(cb, cx, cy)}`);
-      return true;
+      return `\x1B[M${String.fromCharCode(cb, cx, cy)}`;
     }
     if (this.format === "utf8") {
       const cb = String.fromCharCode(32 + code);
       const cx = String.fromCodePoint(32 + col);
       const cy = String.fromCodePoint(32 + row);
-      this.sendReply(`\x1B[M${cb}${cx}${cy}`);
-      return true;
+      return `\x1B[M${cb}${cx}${cy}`;
     }
     if (this.format === "urxvt") {
-      this.sendReply(`\x1B[${32 + code};${col};${row}M`);
-      return true;
+      return `\x1B[${32 + code};${col};${row}M`;
     }
     const suffix = release ? "m" : "M";
     if (this.format === "sgr_pixels" && pixel) {
-      this.sendReply(`\x1B[<${code};${pixel.x};${pixel.y}${suffix}`);
-      return true;
+      return `\x1B[<${code};${pixel.x};${pixel.y}${suffix}`;
     }
-    this.sendReply(`\x1B[<${code};${col};${row}${suffix}`);
-    return true;
+    return `\x1B[<${code};${col};${row}${suffix}`;
   }
 }
-function wheelReportSteps(event, maxSteps = 8) {
+function wheelDeltaPixels(event, cellH, rows) {
   const dy = event.deltaY;
   if (!dy || !Number.isFinite(dy))
     return 0;
-  const sign = dy < 0 ? -1 : 1;
-  let abs;
-  if (event.deltaMode === 1) {
-    abs = Math.max(1, Math.round(Math.abs(dy)));
-  } else if (event.deltaMode === 2) {
-    abs = Math.max(1, Math.round(Math.abs(dy) * 24));
-  } else {
-    abs = Math.max(1, Math.round(Math.abs(dy) / 40));
-  }
-  return sign * Math.min(abs, maxSteps);
+  const h = Math.max(1, cellH);
+  const r = Math.max(1, rows);
+  if (event.deltaMode === 1)
+    return dy * h;
+  if (event.deltaMode === 2)
+    return dy * r * h;
+  return dy;
 }
 
 // src/input/output/csi.ts
@@ -11164,10 +11193,8 @@ function handleOscSequence(seq, handlers) {
         try {
           const encoded = encodeBase64Bytes(bytes2);
           handlers.sendReply(`\x1B]52;${target};${encoded}\x07`);
-        } catch {
-        }
-      }).catch(() => {
-      });
+        } catch {}
+      }).catch(() => {});
       return true;
     }
     if (!handlers.onClipboardWrite)
@@ -11175,11 +11202,9 @@ function handleOscSequence(seq, handlers) {
     let bytes = new Uint8Array(0);
     try {
       bytes = decodeBase64Bytes(payload);
-    } catch {
-    }
+    } catch {}
     const text = textDecoder3.decode(bytes);
-    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {
-    });
+    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {});
     return true;
   }
   const param = parts[1];
@@ -11598,16 +11623,16 @@ class OutputFilter {
 function createInputHandler(options = {}) {
   const config = options.config || {};
   const cursorProvider = options.getCursorPosition || (() => ({ row: 1, col: 1 }));
-  const inputSink = options.sendReply || (() => {
-  });
-  const querySink = options.suppressQueryReplies ? () => {
-  } : inputSink;
+  const inputSink = options.sendReply || (() => {});
+  const querySink = options.suppressQueryReplies ? () => {} : inputSink;
   const positionToCell = options.positionToCell || (() => ({ row: 0, col: 0 }));
   const positionToPixel = options.positionToPixel || null;
   const mouse = new MouseController({
     sendReply: inputSink,
     positionToCell,
-    positionToPixel: positionToPixel ?? undefined
+    positionToPixel: positionToPixel ?? undefined,
+    getCellHeight: options.getCellHeight,
+    getRows: options.getRows
   });
   const filter = new OutputFilter({
     getCursorPosition: cursorProvider,
@@ -12021,8 +12046,7 @@ async function tryFetchFontBuffer(url) {
     const response = await fetch(url);
     if (response.ok)
       return response.arrayBuffer();
-  } catch {
-  }
+  } catch {}
   return null;
 }
 async function tryLocalFontBuffer(matchers) {
@@ -12040,8 +12064,7 @@ async function tryLocalFontBuffer(matchers) {
       const status = await queryPermission({ name: "local-fonts" });
       if (status?.state === "denied")
         return null;
-    } catch {
-    }
+    } catch {}
   }
   try {
     const fonts = await queryLocalFonts();
@@ -17074,8 +17097,7 @@ function connectPty(state2, options, callbacks) {
     if (state2.connectId !== connectId) {
       try {
         ws.close();
-      } catch {
-      }
+      } catch {}
       return;
     }
     if (state2.socket !== ws)
@@ -17188,8 +17210,7 @@ function handleServerMessage(payload, callbacks) {
       callbacks.onExit?.(msg.code ?? 0);
       return true;
     }
-  } catch {
-  }
+  } catch {}
   return false;
 }
 function isPtyConnected(state2) {
@@ -29315,8 +29336,7 @@ function createSplitDividerFactory(options) {
         return;
       try {
         divider.releasePointerCapture(splitResizeState.pointerId);
-      } catch {
-      }
+      } catch {}
       divider.removeEventListener("pointermove", onPointerMove);
       divider.removeEventListener("pointerup", onPointerEnd);
       divider.removeEventListener("pointercancel", onPointerEnd);
@@ -29702,13 +29722,13 @@ function createResttyPaneManager(options) {
 // node_modules/text-shaper/dist/index.js
 var exports_dist = {};
 __export(exports_dist, {
-  verticalLayoutFeatures: () => Kz,
+  verticalLayoutFeatures: () => Zz,
   verticalKanaAlternates: () => HW,
   verticalForms: () => UW,
   verticalAlternatesRotation: () => WW,
   vectorLength: () => X4,
   validateOutline: () => w4,
-  useTypoMetrics: () => PX,
+  useTypoMetrics: () => OX,
   upscale: () => H4,
   updateMinTransformedX: () => fH,
   truncPixel: () => t6,
@@ -29720,35 +29740,35 @@ __export(exports_dist, {
   transformOutline2D: () => O6,
   transformBitmap3D: () => D8,
   transformBitmap2D: () => e6,
-  traditionalForms: () => Yz,
-  thirdWidthForms: () => _z,
+  traditionalForms: () => Gz,
+  thirdWidthForms: () => Hz,
   tagToString: () => h9,
   tag: () => C,
-  tabularFigures: () => o2,
-  swash: () => f2,
-  superscript: () => a2,
+  tabularFigures: () => c2,
+  swash: () => x2,
+  superscript: () => r2,
   subtractBitmap: () => B4,
-  subscript: () => t2,
+  subscript: () => a2,
   subBitmaps: () => c0,
-  stylisticSets: () => h2,
+  stylisticSets: () => S2,
   stylisticSet: () => ZW,
-  stylisticAlternates: () => x2,
+  stylisticAlternates: () => u2,
   strokeUniform: () => d4,
   strokePath: () => H9,
   strokeAsymmetricCombined: () => c9,
   strokeAsymmetric: () => V8,
-  standardLigatures: () => b2,
-  splitWords: () => eG,
-  splitGraphemes: () => tG,
+  standardLigatures: () => y2,
+  splitWords: () => tG,
+  splitGraphemes: () => aG,
   smallCaps: () => qW,
-  slashedZero: () => r2,
-  simplifiedForms: () => Gz,
-  signedDistanceToQuadratic: () => J_,
-  signedDistanceToLine: () => K_,
-  signedDistanceToCubic: () => W_,
+  slashedZero: () => s2,
+  simplifiedForms: () => zz,
+  signedDistanceToQuadratic: () => q_,
+  signedDistanceToLine: () => Z_,
+  signedDistanceToCubic: () => U_,
   sign: () => Y4,
-  shouldGridFit: () => ZV,
-  shouldDoGray: () => KV,
+  shouldGridFit: () => QV,
+  shouldDoGray: () => ZV,
   shiftBitmap: () => l9,
   shearBitmapY: () => J9,
   shearBitmapX: () => q9,
@@ -29756,10 +29776,10 @@ __export(exports_dist, {
   shapedTextToSVGWithVariation: () => qK,
   shapedTextToSVG: () => ZK,
   shapeInto: () => iW,
-  shape: () => fz,
+  shape: () => xz,
   setSize: () => y0,
   setCodeRange: () => a8,
-  scientificInferiors: () => e2,
+  scientificInferiors: () => t2,
   scaleOutlinePow2: () => xH,
   scaleOutline: () => dH,
   scale2D: () => S8,
@@ -29767,7 +29787,7 @@ __export(exports_dist, {
   runGlyphProgram: () => k0,
   runFontProgram: () => I0,
   runCVTProgram: () => v0,
-  ruby: () => qz,
+  ruby: () => Kz,
   roundUpToGrid: () => o5,
   roundToHalfGrid: () => n5,
   roundToGrid: () => U8,
@@ -29793,19 +29813,19 @@ __export(exports_dist, {
   rasterizeText: () => SK,
   rasterizePathWithGradient: () => W9,
   rasterizePath: () => $8,
-  rasterizeLcd: () => j2,
+  rasterizeLcd: () => Y2,
   rasterizeGlyphWithTransform: () => CK,
   rasterizeGlyph: () => i9,
-  quarterWidthForms: () => Hz,
-  proportionalWidthForms: () => Wz,
-  proportionalFigures: () => c2,
+  quarterWidthForms: () => Wz,
+  proportionalWidthForms: () => Uz,
+  proportionalFigures: () => p2,
   processRearrangement: () => u5,
   processLigature: () => f5,
   processInsertion: () => l5,
   processContextual: () => x5,
-  processBidi: () => yG,
+  processBidi: () => hG,
   pipe: () => tK,
-  petiteCaps: () => l2,
+  petiteCaps: () => f2,
   perspectiveMatrix: () => F$,
   pathToSVGWithMatrix3D: () => UK,
   pathToSVGWithMatrix: () => JK,
@@ -29813,7 +29833,7 @@ __export(exports_dist, {
   pathToCanvasWithMatrix3D: () => d0,
   pathToCanvasWithMatrix: () => l0,
   pathToCanvas: () => $9,
-  path: () => v_,
+  path: () => I_,
   parseSuperRound: () => v9,
   parseScriptList: () => q0,
   parsePrep: () => P1,
@@ -29821,7 +29841,7 @@ __export(exports_dist, {
   parseOs2: () => u1,
   parseName: () => V5,
   parseMath: () => b1,
-  parseLookupHeaders: () => VV,
+  parseLookupHeaders: () => NV,
   parseJstf: () => v1,
   parseGasp: () => G1,
   parseFpgm: () => O1,
@@ -29839,14 +29859,14 @@ __export(exports_dist, {
   parseCff: () => U1,
   parseBase: () => J1,
   padBitmap: () => K9,
-  ordinals: () => s2,
-  openTypeTagToAat: () => QV,
-  oldstyleFigures: () => n2,
+  ordinals: () => i2,
+  openTypeTagToAat: () => $V,
+  oldstyleFigures: () => d2,
   obliquePath: () => _9,
   normalizeVector: () => z4,
   normalizeAxisValue: () => p$,
-  normalize: () => v2,
-  mustBreakAt: () => fG,
+  normalize: () => I2,
+  mustBreakAt: () => xG,
   multiply3x3: () => y9,
   multiply2D: () => b8,
   mulFix: () => N4,
@@ -29854,148 +29874,148 @@ __export(exports_dist, {
   mulBitmaps: () => I$,
   msdfAtlasToRGBA: () => sK,
   msdfAtlasToRGB: () => iK,
-  median: () => Z_,
+  median: () => Q_,
   measureRasterGlyph: () => C$,
   maxBitmaps: () => k$,
   matrixToSVGTransform: () => WK,
-  matchAxisValue: () => pX,
+  matchAxisValue: () => nX,
   loadFontProgram: () => S0,
   loadCVTProgram: () => h0,
-  liningFigures: () => p2,
-  lcdToRGBA: () => L2,
-  kerning: () => Zz,
-  justifyParagraph: () => V2,
+  liningFigures: () => n2,
+  lcdToRGBA: () => A2,
+  kerning: () => Qz,
+  justifyParagraph: () => N2,
   justify: () => iU,
-  jis90Forms: () => Xz,
-  jis83Forms: () => Vz,
-  jis78Forms: () => Nz,
-  jis2004Forms: () => zz,
+  jis90Forms: () => Vz,
+  jis83Forms: () => Nz,
+  jis78Forms: () => _z,
+  jis2004Forms: () => Xz,
   italicizeOutline: () => pH,
   isVariationIndexTable: () => $U,
   isTrueType: () => l1,
-  isScript: () => pG,
-  isRTL: () => CG,
-  isOlderSiblingFont: () => dX,
-  isMonospaced: () => kX,
-  isLTR: () => SG,
-  isItalic: () => TX,
-  isExtendedShape: () => eV,
-  isExclusiveFeature: () => rN,
-  isElidableAxisValue: () => lX,
-  isComplexScript: () => rG,
-  isColrV1: () => dN,
-  isCFF: () => bX,
-  isBold: () => OX,
+  isScript: () => nG,
+  isRTL: () => kG,
+  isOlderSiblingFont: () => lX,
+  isMonospaced: () => vX,
+  isLTR: () => CG,
+  isItalic: () => MX,
+  isExtendedShape: () => tV,
+  isExclusiveFeature: () => sN,
+  isElidableAxisValue: () => fX,
+  isComplexScript: () => sG,
+  isColrV1: () => lN,
+  isCFF: () => yX,
+  isBold: () => TX,
   interpolateGradient: () => o0,
   identity3x3: () => A$,
   identity2D: () => I6,
   hypot: () => _K,
-  historicalLigatures: () => g2,
+  historicalLigatures: () => m2,
   hintedToPixels: () => I7,
   hintGlyph: () => b0,
-  hasVertOriginY: () => tX,
-  hasSvgGlyph: () => cX,
-  hasSettingValue: () => eN,
+  hasVertOriginY: () => aX,
+  hasSvgGlyph: () => pX,
+  hasSettingValue: () => tN,
   hasGlyphOutline: () => CH,
-  hasGlyphBitmap: () => yX,
-  hasColorGlyph: () => mN,
-  hasColorBitmap: () => zN,
-  halfWidthForms: () => Jz,
-  glyphVar: () => I_,
+  hasGlyphBitmap: () => hX,
+  hasColorGlyph: () => bN,
+  hasColorBitmap: () => XN,
+  halfWidthForms: () => qz,
+  glyphVar: () => P_,
   glyphToSVG: () => oH,
   glyphBufferToShapedGlyphs: () => iH,
-  glyph: () => O_,
-  getXHeightDelta: () => YX,
+  glyph: () => T_,
+  getXHeightDelta: () => GX,
   getWordBreakProperty: () => AH,
-  getVorgDelta: () => K2,
-  getVisualOrder: () => vG,
-  getVerticalVariants: () => $X,
-  getVerticalMetrics: () => rX,
-  getVerticalAssembly: () => ZX,
-  getVertOriginY: () => aX,
-  getVersion: () => BX,
-  getTsbDelta: () => Q2,
+  getVorgDelta: () => Z2,
+  getVisualOrder: () => IG,
+  getVerticalVariants: () => eV,
+  getVerticalMetrics: () => sX,
+  getVerticalAssembly: () => QX,
+  getVertOriginY: () => rX,
+  getVersion: () => DX,
+  getTsbDelta: () => $2,
   getTrackingValue: () => uU,
-  getTopAccentAttachment: () => tV,
+  getTopAccentAttachment: () => aV,
   getTextWidth: () => sH,
-  getSvgGlyphIds: () => oX,
+  getSvgGlyphIds: () => cX,
   getSvgDocument: () => bU,
-  getSubstitutedLookups: () => X2,
+  getSubstitutedLookups: () => V2,
   getStrikeForPpem: () => CU,
   getShrinkageMods: () => S1,
-  getSettingByValue: () => tN,
-  getScripts: () => nG,
-  getScriptTag: () => oG,
-  getScriptRuns: () => cG,
-  getScriptDirection: () => aG,
+  getSettingByValue: () => aN,
+  getScripts: () => dG,
+  getScriptTag: () => cG,
+  getScriptRuns: () => pG,
+  getScriptDirection: () => rG,
   getScript: () => L0,
-  getSbixGlyphBitmap: () => SX,
-  getPostScriptName: () => DX,
+  getSbixGlyphBitmap: () => CX,
+  getPostScriptName: () => FX,
   getPathBounds: () => _8,
   getOrCreateShapePlan: () => L5,
   getNameById: () => x6,
   getMirror: () => _H,
-  getMinMaxExtent: () => HN,
+  getMinMaxExtent: () => WN,
   getMetricDelta: () => N0,
   getMarkAttachmentType: () => W5,
   getLineBreakClass: () => GH,
-  getLayerPaint: () => nN,
-  getKerxValue: () => dV,
+  getLayerPaint: () => dN,
+  getKerxValue: () => lV,
   getKernValue: () => y1,
   getJstfPriorities: () => C1,
-  getItalicsCorrection: () => aV,
-  getHorizontalVariants: () => QX,
-  getHorizontalAssembly: () => KX,
-  getHDescenderDelta: () => GX,
-  getHAscenderDelta: () => zX,
+  getItalicsCorrection: () => rV,
+  getHorizontalVariants: () => $X,
+  getHorizontalAssembly: () => ZX,
+  getHDescenderDelta: () => zX,
+  getHAscenderDelta: () => XX,
   getGraphemeBreakProperty: () => RQ,
   getGlyphUV: () => uK,
   getGlyphPathWithVariation: () => g9,
   getGlyphPath: () => y6,
-  getGlyphName: () => vX,
+  getGlyphName: () => IX,
   getGlyphLocation: () => x0,
   getGlyphDelta: () => kH,
   getGaspBehavior: () => Y1,
-  getFullName: () => FX,
-  getFontSubfamily: () => LX,
-  getFontFamily: () => AX,
+  getFullName: () => LX,
+  getFontSubfamily: () => AX,
+  getFontFamily: () => wX,
   getFillRuleFromFlags: () => A4,
   getFeature: () => H5,
   getExtensionMods: () => h1,
   getExtenderGlyphs: () => k1,
   getExactBounds: () => EK,
   getEmbeddings: () => WH,
-  getEmbeddingPermission: () => IX,
+  getEmbeddingPermission: () => PX,
   getDeviceDelta: () => QU,
-  getDefaultSetting: () => aN,
-  getDefaultBaseline: () => WN,
+  getDefaultSetting: () => rN,
+  getDefaultBaseline: () => UN,
   getCombiningClass: () => G8,
-  getColorVariationDelta: () => fN,
+  getColorVariationDelta: () => xN,
   getColorPaint: () => SJ,
   getColorLayers: () => CJ,
-  getColorBitmapSizes: () => GN,
-  getColor: () => pN,
-  getClipBox: () => xN,
-  getCharType: () => kG,
-  getCffString: () => wN,
-  getCffGlyphWidth: () => LN,
-  getCapHeightDelta: () => jX,
-  getBsbDelta: () => Z2,
-  getBitmapGlyph: () => VN,
-  getBaselineForScript: () => UN,
-  getAxisValuesForAxis: () => xX,
-  getAxisValueNumber: () => nX,
-  getAxisRecord: () => gX,
-  getAxisIndex: () => uX,
-  getAvailablePpemSizes: () => hX,
-  getAllFeatures: () => sN,
-  getAllBreakOpportunities: () => lG,
+  getColorBitmapSizes: () => zN,
+  getColor: () => nN,
+  getClipBox: () => uN,
+  getCharType: () => vG,
+  getCffString: () => EN,
+  getCffGlyphWidth: () => AN,
+  getCapHeightDelta: () => YX,
+  getBsbDelta: () => Q2,
+  getBitmapGlyph: () => NN,
+  getBaselineForScript: () => JN,
+  getAxisValuesForAxis: () => uX,
+  getAxisValueNumber: () => dX,
+  getAxisRecord: () => mX,
+  getAxisIndex: () => gX,
+  getAvailablePpemSizes: () => SX,
+  getAllFeatures: () => iN,
+  getAllBreakOpportunities: () => fG,
   getAdvanceWidthDelta: () => o$,
-  getAdvanceHeightDelta: () => $2,
-  getAatFeature: () => iN,
+  getAdvanceHeightDelta: () => eX,
+  getAatFeature: () => oN,
   gaussianBlur: () => i6,
-  fullWidthForms: () => Uz,
-  fractions: () => i2,
+  fullWidthForms: () => Jz,
+  fractions: () => o2,
   fracPixel: () => m8,
   floorPixel: () => U4,
   floatToPixel: () => q4,
@@ -30004,12 +30024,12 @@ __export(exports_dist, {
   fixOutline: () => YK,
   findWordBoundaries: () => LH,
   findScript: () => U0,
-  findNextBreak: () => uG,
+  findNextBreak: () => gG,
   findMatchingFeatureVariation: () => X0,
   findLangSys: () => j1,
   findGraphemeBoundaries: () => MQ,
-  findAxisValueByNameId: () => fX,
-  features: () => jz,
+  findAxisValueByNameId: () => xX,
+  features: () => Yz,
   feature: () => _W,
   fastGaussianBlur: () => a9,
   f26Dot6ToFloat: () => K4,
@@ -30025,50 +30045,50 @@ __export(exports_dist, {
   emboldenBitmap: () => u8,
   downscale: () => _4,
   divFix: () => V4,
-  discretionaryLigatures: () => m2,
-  detectScript: () => dG,
-  detectDirection: () => hG,
+  discretionaryLigatures: () => b2,
+  detectScript: () => lG,
+  detectDirection: () => SG,
   decomposePath: () => F8,
   decompose: () => w5,
-  createShapePlan: () => Bz,
+  createShapePlan: () => Dz,
   createPath2D: () => R$,
-  createLookupDigest: () => zV,
+  createLookupDigest: () => XV,
   createHintingEngine: () => C0,
   createGradientBitmap: () => i0,
   createGlyphZone: () => J8,
   createGaussianKernel: () => m$,
-  createFace: () => h_,
+  createFace: () => S_,
   createExecContext: () => M0,
   createDefaultGraphicsState: () => d5,
   createBitmap: () => r,
-  countGraphemes: () => $Y,
+  countGraphemes: () => eG,
   copyBitmap: () => U6,
   convertBitmap: () => N8,
   contourToPath: () => B$,
-  contextualAlternates: () => u2,
+  contextualAlternates: () => g2,
   condensePath: () => N9,
   computeTightBounds: () => f0,
   computeControlBox: () => L$,
   compositeBitmaps: () => v$,
   compensate: () => W8,
   combinePaths: () => m9,
-  combineFeatures: () => Ez,
-  combine: () => C_,
-  colorToRgba: () => cN,
-  colorToHex: () => oN,
+  combineFeatures: () => jz,
+  combine: () => k_,
+  colorToRgba: () => pN,
+  colorToHex: () => cN,
   clonePath: () => e8,
   clearBitmap: () => O$,
   clamp: () => G4,
-  characterVariants: () => y2,
+  characterVariants: () => h2,
   characterVariant: () => KW,
-  char: () => P_,
+  char: () => O_,
   ceilPixel: () => W4,
-  caseSensitiveForms: () => $z,
+  caseSensitiveForms: () => e2,
   cascadeBlur: () => d8,
   capsToSmallCaps: () => JW,
-  capitalSpacing: () => Qz,
-  canBreakAt: () => xG,
-  calculateVariationDelta: () => vN,
+  capitalSpacing: () => $z,
+  canBreakAt: () => uG,
+  calculateVariationDelta: () => IN,
   calculateTupleScalar: () => u0,
   calculateLineWidth: () => j5,
   buildStringAtlas: () => bK,
@@ -30077,38 +30097,38 @@ __export(exports_dist, {
   buildMsdfAsciiAtlas: () => cK,
   buildAtlas: () => t0,
   buildAsciiAtlas: () => yK,
-  breakIntoLines: () => N2,
+  breakIntoLines: () => _2,
   boxBlur: () => B8,
   blurBitmap: () => wK,
   blendBitmap: () => p0,
   bitmapToRGBA: () => s9,
   bitmapToGray: () => r9,
-  bitmap: () => k_,
+  bitmap: () => v_,
   atlasToRGBA: () => mK,
   atlasToAlpha: () => gK,
   assignEdgeColors: () => pK,
-  applyTracking: () => sX,
+  applyTracking: () => iX,
   applyNonContextual: () => g1,
   applyMirroring: () => NH,
   applyMatrixToContext: () => rH,
-  applyFeatureVariations: () => z2,
+  applyFeatureVariations: () => X2,
   applyFallbackMarkPositioning: () => o1,
   applyFallbackKerning: () => i1,
-  applyDeviceAdjustment: () => HV,
+  applyDeviceAdjustment: () => WV,
   applyAvarMapping: () => cq,
   applyAvar: () => n$,
   analyzeLineBreaksFromCodepoints: () => BQ,
-  analyzeLineBreaksForGlyphs: () => gG,
-  analyzeLineBreaks: () => mG,
-  allSmallCaps: () => d2,
+  analyzeLineBreaksForGlyphs: () => mG,
+  analyzeLineBreaks: () => bG,
+  allSmallCaps: () => l2,
   addBitmaps: () => P$,
   adaptiveBlur: () => t9,
   abs: () => l6,
-  aatToOpenTypeTag: () => $V,
+  aatToOpenTypeTag: () => eN,
   WordBreakProperty: () => wH,
-  WindowsEncodingId: () => EX,
-  WidthClass: () => MX,
-  WeightClass: () => RX,
+  WindowsEncodingId: () => jX,
+  WidthClass: () => RX,
+  WeightClass: () => BX,
   VerticalPositionSetting: () => mJ,
   UpperCaseSetting: () => pJ,
   UnicodeBuffer: () => C7,
@@ -30142,11 +30162,11 @@ __export(exports_dist, {
   LineBreakClass: () => VH,
   LigatureSetting: () => bJ,
   LcdMode: () => aU,
-  LCD_FILTER_LIGHT: () => G2,
-  LCD_FILTER_LEGACY: () => Y2,
+  LCD_FILTER_LIGHT: () => z2,
+  LCD_FILTER_LEGACY: () => G2,
   LCD_FILTER_DEFAULT: () => rU,
   JustifyMode: () => oU,
-  JstfPriority: () => SV,
+  JstfPriority: () => CV,
   GraphemeBreakProperty: () => EH,
   GlyphClass: () => g0,
   GlyphBuffer: () => C8,
@@ -30158,7 +30178,7 @@ __export(exports_dist, {
   Font: () => Z8,
   FillRule: () => H8,
   FeatureType: () => yJ,
-  FeatureTags: () => cY,
+  FeatureTags: () => pY,
   FeatureFlags: () => sJ,
   Face: () => n8,
   F26DOT6_SHIFT: () => tH,
@@ -30176,14 +30196,14 @@ __export(exports_dist, {
   ClusterLevel: () => v7,
   ClassDef: () => O8,
   CharacterShapeSetting: () => iJ,
-  CbdtImageFormat: () => _N,
+  CbdtImageFormat: () => HN,
   CaseSensitiveLayoutSetting: () => fJ,
   BufferFlags: () => k7,
   BreakOpportunity: () => zH,
   BreakAction: () => XH,
   BitmapBuilder: () => i,
   BidiType: () => i8,
-  BaselineTag: () => KN,
+  BaselineTag: () => ZN,
   AxisValueFlags: () => d1,
   $translate: () => Qq,
   $transformGlyph3D: () => kq,
@@ -30351,7 +30371,7 @@ var JJ = I9(() => {
 	`), b("", 0, ":"), b(" ", 0, ". "), b("", 0, "ed "), b("", 20, ""), b("", 18, ""), b("", 6, ""), b("", 0, "("), b("", 10, ", "), b("", 8, ""), b("", 0, " at "), b("", 0, "ly "), b(" the ", 0, " of "), b("", 5, ""), b("", 9, ""), b(" ", 10, ", "), b("", 10, '"'), b(".", 0, "("), b("", 11, " "), b("", 10, '">'), b("", 0, '="'), b(" ", 0, "."), b(".com/", 0, ""), b(" the ", 0, " of the "), b("", 10, "'"), b("", 0, ". This "), b("", 0, ","), b(".", 0, " "), b("", 10, "("), b("", 10, "."), b("", 0, " not "), b(" ", 0, '="'), b("", 0, "er "), b(" ", 11, " "), b("", 0, "al "), b(" ", 11, ""), b("", 0, "='"), b("", 11, '"'), b("", 10, ". "), b(" ", 0, "("), b("", 0, "ful "), b(" ", 10, ". "), b("", 0, "ive "), b("", 0, "less "), b("", 11, "'"), b("", 0, "est "), b(" ", 10, "."), b("", 11, '">'), b(" ", 0, "='"), b("", 10, ","), b("", 0, "ize "), b("", 11, "."), b("Â ", 0, ""), b(" ", 0, ","), b("", 10, '="'), b("", 11, '="'), b("", 0, "ous "), b("", 11, ", "), b("", 10, "='"), b(" ", 10, ","), b(" ", 11, '="'), b(" ", 11, ", "), b("", 11, ","), b("", 11, "("), b("", 11, ". "), b(" ", 11, "."), b("", 11, "='"), b(" ", 11, ". "), b(" ", 10, '="'), b(" ", 11, "='"), b(" ", 10, "='")];
 });
 var XJ = {};
-OQ(XJ, { decompress: () => i_, __testing: () => s_ });
+OQ(XJ, { decompress: () => o_, __testing: () => i_ });
 
 class Z1 {
   data;
@@ -30479,7 +30499,7 @@ function _J($, Q, Z) {
 }
 function R8($, Q, Z) {
   Z.fillBitWindow();
-  let K = Q + (Z.currentVal >>> Z.currentBitPos & g_), q = $[K].bits - e$;
+  let K = Q + (Z.currentVal >>> Z.currentBitPos & m_), q = $[K].bits - e$;
   if (q > 0)
     Z.currentBitPos += e$, K += $[K].value, K += Z.currentVal >>> Z.currentBitPos & (1 << q) - 1;
   return Z.currentBitPos += $[K].bits, $[K].value;
@@ -30493,7 +30513,7 @@ function NJ($) {
   }
   return 0;
 }
-function p_($) {
+function n_($) {
   if ($.readBits(1) === 0)
     return 16;
   let Q = $.readBits(3);
@@ -30503,7 +30523,7 @@ function p_($) {
     return 8 + Q;
   return 17;
 }
-function c_($) {
+function p_($) {
   let Q = $.readBits(1) === 1;
   if (Q && $.readBits(1))
     return { length: 0, isLast: true, isUncompressed: false, isMetadata: false };
@@ -30598,7 +30618,7 @@ function Z5($, Q, Z, K) {
   } else {
     let U = new Uint8Array(Q5), W = 32, H = 0, _ = [{ bits: 2, value: 0 }, { bits: 2, value: 4 }, { bits: 2, value: 3 }, { bits: 3, value: 2 }, { bits: 2, value: 0 }, { bits: 2, value: 4 }, { bits: 2, value: 3 }, { bits: 4, value: 1 }, { bits: 2, value: 0 }, { bits: 2, value: 4 }, { bits: 2, value: 3 }, { bits: 3, value: 2 }, { bits: 2, value: 0 }, { bits: 2, value: 4 }, { bits: 2, value: 3 }, { bits: 4, value: 5 }];
     for (let N = J;N < Q5 && W > 0; N++) {
-      let V = u_[N];
+      let V = g_[N];
       K.fillBitWindow();
       let X = K.currentVal >>> K.currentBitPos & 15;
       K.currentBitPos += _[X].bits;
@@ -30680,21 +30700,21 @@ function HJ($, Q) {
   return { numHTrees: Z, contextMap: K };
 }
 function Q0($, Q, Z) {
-  let K = R8($, Q, Z), q = l_[K];
+  let K = R8($, Q, Z), q = f_[K];
   return q.offset + Z.readBits(q.nbits);
 }
-function o_($, Q, Z) {
+function c_($, Q, Z) {
   if ($ < t$) {
-    let K = Z + x_[$] & 3;
-    return Q[K] + f_[$];
+    let K = Z + u_[$] & 3;
+    return Q[K] + x_[$];
   }
   return $ - t$ + 1;
 }
-function i_($) {
-  let Q = new Z1($), Z = p_(Q), K = (1 << Z) - 16, q = 1 << Z, J = q - 1, U = new Uint8Array(q + 578), W = 0, H = 0, _ = [16, 15, 11, 4], N = 0, V = 0, X = 0, z = [];
+function o_($) {
+  let Q = new Z1($), Z = n_(Q), K = (1 << Z) - 16, q = 1 << Z, J = q - 1, U = new Uint8Array(q + 578), W = 0, H = 0, _ = [16, 15, 11, 4], N = 0, V = 0, X = 0, z = [];
   while (true) {
     Q.readMoreInput();
-    let G = c_(Q);
+    let G = p_(Q);
     if (G.length === 0 && G.isLast)
       break;
     if (G.isMetadata) {
@@ -30722,15 +30742,15 @@ function i_($) {
       D.push({ bits: 0, value: 0 }), F.push({ bits: 0, value: 0 });
     for (let n = 0;n < 3; n++)
       if (j[n] = NJ(Q) + 1, j[n] >= 2)
-        Z5(j[n] + 2, D, n * X8, Q), Z5(m_, F, n * X8, Q), E[n] = Q0(F, n * X8, Q), A[n] = 1;
+        Z5(j[n] + 2, D, n * X8, Q), Z5(b_, F, n * X8, Q), E[n] = Q0(F, n * X8, Q), A[n] = 1;
     Q.readMoreInput();
     let M = Q.readBits(2), R = t$ + (Q.readBits(4) << M), P = (1 << M) - 1, T = R + (48 << M), m = new Uint8Array(j[0]);
     for (let n = 0;n < j[0]; n++)
       Q.readMoreInput(), m[n] = Q.readBits(2) << 1;
-    let v = HJ(j[0] << 6, Q), f = HJ(j[2] << 2, Q), l = [new $5(y_, v.numHTrees), new $5(b_, j[1]), new $5(T, f.numHTrees)];
+    let v = HJ(j[0] << 6, Q), f = HJ(j[2] << 2, Q), l = [new $5(h_, v.numHTrees), new $5(y_, j[1]), new $5(T, f.numHTrees)];
     for (let n = 0;n < 3; n++)
       l[n].decode(Q);
-    let k = 0, O = 0, h = m[w[0]], S = $0[h], d = $0[h + 1], c = l[1].htrees[0];
+    let k = 0, O = 0, h = m[w[0]], S = $0[h], d = $0[h + 1], o = l[1].htrees[0];
     while (Y > 0) {
       if (Q.readMoreInput(), E[1] === 0) {
         let g6 = R8(D, X8, Q), S6;
@@ -30742,15 +30762,15 @@ function i_($) {
           S6 = g6 - 2;
         if (S6 >= j[1])
           S6 -= j[1];
-        w[1] = S6, L[2 + (A[1] & 1)] = S6, A[1]++, E[1] = Q0(F, X8, Q), c = l[1].htrees[w[1]];
+        w[1] = S6, L[2 + (A[1] & 1)] = S6, A[1]++, E[1] = Q0(F, X8, Q), o = l[1].htrees[w[1]];
       }
       E[1]--;
-      let n = R8(l[1].codes, c, Q), e = n >> 6, u;
+      let n = R8(l[1].codes, o, Q), e = n >> 6, u;
       if (e >= 2)
         u = -1;
       else
         u = 0;
-      let N6 = d_[e] + (n >> 3 & 7), y = n_[e] + (n & 7), t = UJ[N6].offset + Q.readBits(UJ[N6].nbits), g = WJ[y].offset + Q.readBits(WJ[y].nbits);
+      let N6 = l_[e] + (n >> 3 & 7), y = d_[e] + (n & 7), t = UJ[N6].offset + Q.readBits(UJ[N6].nbits), g = WJ[y].offset + Q.readBits(WJ[y].nbits);
       V = U[W - 1 & J], X = U[W - 2 & J];
       for (let g6 = 0;g6 < t; g6++) {
         if (Q.readMoreInput(), E[0] === 0) {
@@ -30795,7 +30815,7 @@ function i_($) {
           u = R + (c6 + Q.readBits(M6) << M) + r6;
         }
       }
-      let w6 = o_(u, _, N);
+      let w6 = c_(u, _, N);
       if (w6 < 0)
         throw Error("Invalid distance");
       if (W < K && H !== K)
@@ -30837,27 +30857,27 @@ function i_($) {
 }
 var X8 = 1080;
 var Q5 = 18;
-var y_ = 256;
-var b_ = 704;
-var m_ = 26;
+var h_ = 256;
+var y_ = 704;
+var b_ = 26;
 var t$ = 16;
 var e$ = 8;
-var g_ = 255;
+var m_ = 255;
+var g_;
 var u_;
 var x_;
 var f_;
-var l_;
 var UJ;
 var WJ;
+var l_;
 var d_;
-var n_;
-var s_;
+var i_;
 var zJ = I9(() => {
   tq();
   ZJ();
   JJ();
-  u_ = new Uint8Array([1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]), x_ = new Uint8Array([3, 2, 1, 0, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2]), f_ = new Int8Array([0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3]), l_ = [{ offset: 1, nbits: 2 }, { offset: 5, nbits: 2 }, { offset: 9, nbits: 2 }, { offset: 13, nbits: 2 }, { offset: 17, nbits: 3 }, { offset: 25, nbits: 3 }, { offset: 33, nbits: 3 }, { offset: 41, nbits: 3 }, { offset: 49, nbits: 4 }, { offset: 65, nbits: 4 }, { offset: 81, nbits: 4 }, { offset: 97, nbits: 4 }, { offset: 113, nbits: 5 }, { offset: 145, nbits: 5 }, { offset: 177, nbits: 5 }, { offset: 209, nbits: 5 }, { offset: 241, nbits: 6 }, { offset: 305, nbits: 6 }, { offset: 369, nbits: 7 }, { offset: 497, nbits: 8 }, { offset: 753, nbits: 9 }, { offset: 1265, nbits: 10 }, { offset: 2289, nbits: 11 }, { offset: 4337, nbits: 12 }, { offset: 8433, nbits: 13 }, { offset: 16625, nbits: 24 }], UJ = [{ offset: 0, nbits: 0 }, { offset: 1, nbits: 0 }, { offset: 2, nbits: 0 }, { offset: 3, nbits: 0 }, { offset: 4, nbits: 0 }, { offset: 5, nbits: 0 }, { offset: 6, nbits: 1 }, { offset: 8, nbits: 1 }, { offset: 10, nbits: 2 }, { offset: 14, nbits: 2 }, { offset: 18, nbits: 3 }, { offset: 26, nbits: 3 }, { offset: 34, nbits: 4 }, { offset: 50, nbits: 4 }, { offset: 66, nbits: 5 }, { offset: 98, nbits: 5 }, { offset: 130, nbits: 6 }, { offset: 194, nbits: 7 }, { offset: 322, nbits: 8 }, { offset: 578, nbits: 9 }, { offset: 1090, nbits: 10 }, { offset: 2114, nbits: 12 }, { offset: 6210, nbits: 14 }, { offset: 22594, nbits: 24 }], WJ = [{ offset: 2, nbits: 0 }, { offset: 3, nbits: 0 }, { offset: 4, nbits: 0 }, { offset: 5, nbits: 0 }, { offset: 6, nbits: 0 }, { offset: 7, nbits: 0 }, { offset: 8, nbits: 0 }, { offset: 9, nbits: 0 }, { offset: 10, nbits: 1 }, { offset: 12, nbits: 1 }, { offset: 14, nbits: 2 }, { offset: 18, nbits: 2 }, { offset: 22, nbits: 3 }, { offset: 30, nbits: 3 }, { offset: 38, nbits: 4 }, { offset: 54, nbits: 4 }, { offset: 70, nbits: 5 }, { offset: 102, nbits: 5 }, { offset: 134, nbits: 6 }, { offset: 198, nbits: 7 }, { offset: 326, nbits: 8 }, { offset: 582, nbits: 9 }, { offset: 1094, nbits: 10 }, { offset: 2118, nbits: 24 }], d_ = [0, 0, 8, 8, 0, 16, 8, 16, 16], n_ = [0, 8, 0, 8, 16, 0, 16, 8, 16];
-  s_ = { getNextKey: $1, replicateValue: Q1, nextTableBitSize: _J, buildHuffmanTable: K1, readBlockLength: Q0, readHuffmanCodeLengths: VJ, BitReader: Z1, HuffmanCode: {}, CODE_LENGTH_CODES: Q5 };
+  g_ = new Uint8Array([1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]), u_ = new Uint8Array([3, 2, 1, 0, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2]), x_ = new Int8Array([0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3]), f_ = [{ offset: 1, nbits: 2 }, { offset: 5, nbits: 2 }, { offset: 9, nbits: 2 }, { offset: 13, nbits: 2 }, { offset: 17, nbits: 3 }, { offset: 25, nbits: 3 }, { offset: 33, nbits: 3 }, { offset: 41, nbits: 3 }, { offset: 49, nbits: 4 }, { offset: 65, nbits: 4 }, { offset: 81, nbits: 4 }, { offset: 97, nbits: 4 }, { offset: 113, nbits: 5 }, { offset: 145, nbits: 5 }, { offset: 177, nbits: 5 }, { offset: 209, nbits: 5 }, { offset: 241, nbits: 6 }, { offset: 305, nbits: 6 }, { offset: 369, nbits: 7 }, { offset: 497, nbits: 8 }, { offset: 753, nbits: 9 }, { offset: 1265, nbits: 10 }, { offset: 2289, nbits: 11 }, { offset: 4337, nbits: 12 }, { offset: 8433, nbits: 13 }, { offset: 16625, nbits: 24 }], UJ = [{ offset: 0, nbits: 0 }, { offset: 1, nbits: 0 }, { offset: 2, nbits: 0 }, { offset: 3, nbits: 0 }, { offset: 4, nbits: 0 }, { offset: 5, nbits: 0 }, { offset: 6, nbits: 1 }, { offset: 8, nbits: 1 }, { offset: 10, nbits: 2 }, { offset: 14, nbits: 2 }, { offset: 18, nbits: 3 }, { offset: 26, nbits: 3 }, { offset: 34, nbits: 4 }, { offset: 50, nbits: 4 }, { offset: 66, nbits: 5 }, { offset: 98, nbits: 5 }, { offset: 130, nbits: 6 }, { offset: 194, nbits: 7 }, { offset: 322, nbits: 8 }, { offset: 578, nbits: 9 }, { offset: 1090, nbits: 10 }, { offset: 2114, nbits: 12 }, { offset: 6210, nbits: 14 }, { offset: 22594, nbits: 24 }], WJ = [{ offset: 2, nbits: 0 }, { offset: 3, nbits: 0 }, { offset: 4, nbits: 0 }, { offset: 5, nbits: 0 }, { offset: 6, nbits: 0 }, { offset: 7, nbits: 0 }, { offset: 8, nbits: 0 }, { offset: 9, nbits: 0 }, { offset: 10, nbits: 1 }, { offset: 12, nbits: 1 }, { offset: 14, nbits: 2 }, { offset: 18, nbits: 2 }, { offset: 22, nbits: 3 }, { offset: 30, nbits: 3 }, { offset: 38, nbits: 4 }, { offset: 54, nbits: 4 }, { offset: 70, nbits: 5 }, { offset: 102, nbits: 5 }, { offset: 134, nbits: 6 }, { offset: 198, nbits: 7 }, { offset: 326, nbits: 8 }, { offset: 582, nbits: 9 }, { offset: 1094, nbits: 10 }, { offset: 2118, nbits: 24 }], l_ = [0, 0, 8, 8, 0, 16, 8, 16, 16], d_ = [0, 8, 0, 8, 16, 0, 16, 8, 16];
+  i_ = { getNextKey: $1, replicateValue: Q1, nextTableBitSize: _J, buildHuffmanTable: K1, readBlockLength: Q0, readHuffmanCodeLengths: VJ, BitReader: Z1, HuffmanCode: {}, CODE_LENGTH_CODES: Q5 };
 });
 function R0($, Q) {
   if (Q < 0 || Q >= $.classArray.length)
@@ -31383,8 +31403,7 @@ function aQ($) {
   }
   $.error = "ELSE: missing EIF";
 }
-function tQ($) {
-}
+function tQ($) {}
 function eQ($) {
   let Q = $.stack[--$.stackTop];
   if (Q === undefined) {
@@ -31599,7 +31618,7 @@ function M0($ = 256, Q = 64, Z = 64, K = 64, q = 32, J = 16) {
   return { GS: { ...U }, defaultGS: U, zp0: J8(0, 0), zp1: J8(0, 0), zp2: J8(0, 0), twilight: J8(J, 1), pts: J8(0, 0), stack: new Int32Array($), stackTop: 0, IP: 0, code: new Uint8Array(0), codeSize: 0, currentRange: 0, opcode: 0, numArgs: 0, cvt: new Int32Array(0), cvtSize: 0, storage: new Int32Array(Q), storageSize: Q, FDefs: Array(Z).fill(null).map((W, H) => ({ id: H, start: 0, end: 0, active: false, range: 0 })), maxFDefs: Z, IDefs: Array(K).fill(null).map((W, H) => ({ opcode: H, start: 0, end: 0, active: false, range: 0 })), maxIDefs: K, callStack: Array(q).fill(null).map(() => ({ callerIP: 0, callerRange: 0, def: { id: 0, start: 0, end: 0, active: false, range: 0 }, count: 0 })), callStackTop: 0, maxCallStack: q, codeRanges: new Map, ppem: 12, pointSize: 12, scale: 1, scaleFix: 65536, lightMode: false, grayscale: true, renderMode: "gray", backwardCompatibility: 0, isComposite: false, error: null, instructionCount: 0, maxInstructions: 1e6 };
 }
 var B = { NPUSHB: 64, NPUSHW: 65, PUSHB_0: 176, PUSHB_1: 177, PUSHB_2: 178, PUSHB_3: 179, PUSHB_4: 180, PUSHB_5: 181, PUSHB_6: 182, PUSHB_7: 183, PUSHW_0: 184, PUSHW_1: 185, PUSHW_2: 186, PUSHW_3: 187, PUSHW_4: 188, PUSHW_5: 189, PUSHW_6: 190, PUSHW_7: 191, RS: 67, WS: 66, RCVT: 69, WCVTP: 68, WCVTF: 112, DUP: 32, POP: 33, CLEAR: 34, SWAP: 35, DEPTH: 36, CINDEX: 37, MINDEX: 38, ROLL: 138, ADD: 96, SUB: 97, DIV: 98, MUL: 99, ABS: 100, NEG: 101, FLOOR: 102, CEILING: 103, MAX: 139, MIN: 140, LT: 80, LTEQ: 81, GT: 82, GTEQ: 83, EQ: 84, NEQ: 85, ODD: 86, EVEN: 87, AND: 90, OR: 91, NOT: 92, IF: 88, ELSE: 27, EIF: 89, JMPR: 28, JROT: 120, JROF: 121, FDEF: 44, ENDF: 45, CALL: 43, LOOPCALL: 42, IDEF: 137, SVTCA_Y: 0, SVTCA_X: 1, SPVTCA_Y: 2, SPVTCA_X: 3, SFVTCA_Y: 4, SFVTCA_X: 5, SPVTL_0: 6, SPVTL_1: 7, SFVTL_0: 8, SFVTL_1: 9, SDPVTL_0: 134, SDPVTL_1: 135, SPVFS: 10, SFVFS: 11, GPV: 12, GFV: 13, SFVTPV: 14, ISECT: 15, SRP0: 16, SRP1: 17, SRP2: 18, SZP0: 19, SZP1: 20, SZP2: 21, SZPS: 22, SLOOP: 23, RTG: 24, RTHG: 25, SMD: 26, RDTG: 125, RUTG: 124, ROFF: 122, SROUND: 118, S45ROUND: 119, SCVTCI: 29, SSWCI: 30, SSW: 31, FLIPON: 77, FLIPOFF: 78, SANGW: 126, SDB: 94, SDS: 95, GC_0: 70, GC_1: 71, SCFS: 72, MD_0: 73, MD_1: 74, MPPEM: 75, MPS: 76, FLIPPT: 128, FLIPRGON: 129, FLIPRGOFF: 130, SHP_0: 50, SHP_1: 51, SHC_0: 52, SHC_1: 53, SHZ_0: 54, SHZ_1: 55, SHPIX: 56, IP: 57, MSIRP_0: 58, MSIRP_1: 59, ALIGNRP: 60, RTDG: 61, MIAP_0: 62, MIAP_1: 63, ALIGNPTS: 39, UTP: 41, MDAP_0: 46, MDAP_1: 47, IUP_Y: 48, IUP_X: 49, DELTAP1: 93, DELTAP2: 113, DELTAP3: 114, DELTAC1: 115, DELTAC2: 116, DELTAC3: 117, ROUND_0: 104, ROUND_1: 105, ROUND_2: 106, ROUND_3: 107, NROUND_0: 108, NROUND_1: 109, NROUND_2: 110, NROUND_3: 111, GETINFO: 136, INSTCTRL: 142, SCANCTRL: 133, SCANTYPE: 141, AA: 127, DEBUG: 79, MDRP_BASE: 192, MIRP_BASE: 224 };
-var JY = { [B.RS]: 1, [B.WS]: 2, [B.RCVT]: 1, [B.WCVTP]: 2, [B.WCVTF]: 2, [B.DUP]: 1, [B.POP]: 1, [B.CLEAR]: 0, [B.SWAP]: 2, [B.DEPTH]: 0, [B.CINDEX]: 1, [B.MINDEX]: 1, [B.ROLL]: 3, [B.ADD]: 2, [B.SUB]: 2, [B.DIV]: 2, [B.MUL]: 2, [B.ABS]: 1, [B.NEG]: 1, [B.FLOOR]: 1, [B.CEILING]: 1, [B.MAX]: 2, [B.MIN]: 2, [B.LT]: 2, [B.LTEQ]: 2, [B.GT]: 2, [B.GTEQ]: 2, [B.EQ]: 2, [B.NEQ]: 2, [B.ODD]: 1, [B.EVEN]: 1, [B.AND]: 2, [B.OR]: 2, [B.NOT]: 1, [B.IF]: 1, [B.JMPR]: 1, [B.JROT]: 2, [B.JROF]: 2, [B.CALL]: 1, [B.LOOPCALL]: 2, [B.SRP0]: 1, [B.SRP1]: 1, [B.SRP2]: 1, [B.SZP0]: 1, [B.SZP1]: 1, [B.SZP2]: 1, [B.SZPS]: 1, [B.SLOOP]: 1, [B.SMD]: 1, [B.SCVTCI]: 1, [B.SSWCI]: 1, [B.SSW]: 1, [B.SDB]: 1, [B.SDS]: 1, [B.SPVFS]: 2, [B.SFVFS]: 2, [B.SPVTL_0]: 2, [B.SPVTL_1]: 2, [B.SFVTL_0]: 2, [B.SFVTL_1]: 2, [B.SCFS]: 2, [B.GC_0]: 1, [B.GC_1]: 1, [B.MD_0]: 2, [B.MD_1]: 2, [B.ISECT]: 5, [B.ALIGNRP]: 0, [B.IP]: 0, [B.SHPIX]: 1, [B.MSIRP_0]: 2, [B.MSIRP_1]: 2, [B.MIAP_0]: 2, [B.MIAP_1]: 2, [B.MDAP_0]: 1, [B.MDAP_1]: 1, [B.DELTAP1]: 1, [B.DELTAP2]: 1, [B.DELTAP3]: 1, [B.DELTAC1]: 1, [B.DELTAC2]: 1, [B.DELTAC3]: 1, [B.SROUND]: 1, [B.S45ROUND]: 1, [B.ROUND_0]: 1, [B.ROUND_1]: 1, [B.ROUND_2]: 1, [B.ROUND_3]: 1, [B.NROUND_0]: 1, [B.NROUND_1]: 1, [B.NROUND_2]: 1, [B.NROUND_3]: 1, [B.INSTCTRL]: 2, [B.SCANCTRL]: 1, [B.SCANTYPE]: 1, [B.GETINFO]: 1, [B.FLIPPT]: 0, [B.FLIPRGON]: 2, [B.FLIPRGOFF]: 2 };
+var qY = { [B.RS]: 1, [B.WS]: 2, [B.RCVT]: 1, [B.WCVTP]: 2, [B.WCVTF]: 2, [B.DUP]: 1, [B.POP]: 1, [B.CLEAR]: 0, [B.SWAP]: 2, [B.DEPTH]: 0, [B.CINDEX]: 1, [B.MINDEX]: 1, [B.ROLL]: 3, [B.ADD]: 2, [B.SUB]: 2, [B.DIV]: 2, [B.MUL]: 2, [B.ABS]: 1, [B.NEG]: 1, [B.FLOOR]: 1, [B.CEILING]: 1, [B.MAX]: 2, [B.MIN]: 2, [B.LT]: 2, [B.LTEQ]: 2, [B.GT]: 2, [B.GTEQ]: 2, [B.EQ]: 2, [B.NEQ]: 2, [B.ODD]: 1, [B.EVEN]: 1, [B.AND]: 2, [B.OR]: 2, [B.NOT]: 1, [B.IF]: 1, [B.JMPR]: 1, [B.JROT]: 2, [B.JROF]: 2, [B.CALL]: 1, [B.LOOPCALL]: 2, [B.SRP0]: 1, [B.SRP1]: 1, [B.SRP2]: 1, [B.SZP0]: 1, [B.SZP1]: 1, [B.SZP2]: 1, [B.SZPS]: 1, [B.SLOOP]: 1, [B.SMD]: 1, [B.SCVTCI]: 1, [B.SSWCI]: 1, [B.SSW]: 1, [B.SDB]: 1, [B.SDS]: 1, [B.SPVFS]: 2, [B.SFVFS]: 2, [B.SPVTL_0]: 2, [B.SPVTL_1]: 2, [B.SFVTL_0]: 2, [B.SFVTL_1]: 2, [B.SCFS]: 2, [B.GC_0]: 1, [B.GC_1]: 1, [B.MD_0]: 2, [B.MD_1]: 2, [B.ISECT]: 5, [B.ALIGNRP]: 0, [B.IP]: 0, [B.SHPIX]: 1, [B.MSIRP_0]: 2, [B.MSIRP_1]: 2, [B.MIAP_0]: 2, [B.MIAP_1]: 2, [B.MDAP_0]: 1, [B.MDAP_1]: 1, [B.DELTAP1]: 1, [B.DELTAP2]: 1, [B.DELTAP3]: 1, [B.DELTAC1]: 1, [B.DELTAC2]: 1, [B.DELTAC3]: 1, [B.SROUND]: 1, [B.S45ROUND]: 1, [B.ROUND_0]: 1, [B.ROUND_1]: 1, [B.ROUND_2]: 1, [B.ROUND_3]: 1, [B.NROUND_0]: 1, [B.NROUND_1]: 1, [B.NROUND_2]: 1, [B.NROUND_3]: 1, [B.INSTCTRL]: 2, [B.SCANCTRL]: 1, [B.SCANTYPE]: 1, [B.GETINFO]: 1, [B.FLIPPT]: 0, [B.FLIPRGON]: 2, [B.FLIPRGOFF]: 2 };
 function U8($, Q) {
   if ($ >= 0) {
     let Z = $ + Q + 32 & -64;
@@ -33299,7 +33318,7 @@ function h9($) {
   return String.fromCharCode($ >> 24 & 255, $ >> 16 & 255, $ >> 8 & 255, $ & 255);
 }
 var p = { head: C("head"), hhea: C("hhea"), hmtx: C("hmtx"), maxp: C("maxp"), cmap: C("cmap"), loca: C("loca"), glyf: C("glyf"), name: C("name"), OS2: C("OS/2"), post: C("post"), GDEF: C("GDEF"), GSUB: C("GSUB"), GPOS: C("GPOS"), BASE: C("BASE"), JSTF: C("JSTF"), MATH: C("MATH"), CFF: C("CFF "), CFF2: C("CFF2"), fvar: C("fvar"), gvar: C("gvar"), avar: C("avar"), HVAR: C("HVAR"), VVAR: C("VVAR"), MVAR: C("MVAR"), morx: C("morx"), kerx: C("kerx"), kern: C("kern"), trak: C("trak"), feat: C("feat"), COLR: C("COLR"), CPAL: C("CPAL"), SVG: C("SVG "), sbix: C("sbix"), CBDT: C("CBDT"), CBLC: C("CBLC"), STAT: C("STAT"), vhea: C("vhea"), vmtx: C("vmtx"), VORG: C("VORG"), fpgm: C("fpgm"), prep: C("prep"), cvt: C("cvt "), gasp: C("gasp") };
-var cY = { ccmp: C("ccmp"), locl: C("locl"), rlig: C("rlig"), liga: C("liga"), clig: C("clig"), calt: C("calt"), rclt: C("rclt"), dlig: C("dlig"), smcp: C("smcp"), c2sc: C("c2sc"), isol: C("isol"), init: C("init"), medi: C("medi"), fina: C("fina"), kern: C("kern"), mark: C("mark"), mkmk: C("mkmk"), curs: C("curs"), dist: C("dist") };
+var pY = { ccmp: C("ccmp"), locl: C("locl"), rlig: C("rlig"), liga: C("liga"), clig: C("clig"), calt: C("calt"), rclt: C("rclt"), dlig: C("dlig"), smcp: C("smcp"), c2sc: C("c2sc"), isol: C("isol"), init: C("init"), medi: C("medi"), fina: C("fina"), kern: C("kern"), mark: C("mark"), mkmk: C("mkmk"), curs: C("curs"), dist: C("dist") };
 
 class C8 {
   direction = 4;
@@ -34641,17 +34660,17 @@ function ZK($, Q, Z) {
       if (H && !_) {
         let S = [[H[0][0] * N, H[0][1] * N, H[0][0] * k + H[0][1] * O + H[0][2]], [H[1][0] * N, H[1][1] * N, H[1][0] * k + H[1][1] * O + H[1][2]], [H[2][0] * N, H[2][1] * N, H[2][0] * k + H[2][1] * O + H[2][2]]];
         h = UK(l, S);
-        let d = l.bounds, c = [$6(d.xMin * N + k, -d.yMax * N + O, H), $6(d.xMax * N + k, -d.yMax * N + O, H), $6(d.xMin * N + k, -d.yMin * N + O, H), $6(d.xMax * N + k, -d.yMin * N + O, H)];
-        for (let n = 0;n < c.length; n++) {
-          let e = c[n];
+        let d = l.bounds, o = [$6(d.xMin * N + k, -d.yMax * N + O, H), $6(d.xMax * N + k, -d.yMax * N + O, H), $6(d.xMin * N + k, -d.yMin * N + O, H), $6(d.xMax * N + k, -d.yMin * N + O, H)];
+        for (let n = 0;n < o.length; n++) {
+          let e = o[n];
           G = Math.min(G, e.x), Y = Math.max(Y, e.x), j = Math.min(j, e.y), E = Math.max(E, e.y);
         }
       } else if (W && !_) {
         let S = [W[0] * N, W[1] * N, W[2] * N, W[3] * N, W[0] * k + W[2] * O + W[4], W[1] * k + W[3] * O + W[5]];
         h = JK(l, S);
-        let d = l.bounds, c = [Q6(d.xMin * N + k, -d.yMax * N + O, W), Q6(d.xMax * N + k, -d.yMax * N + O, W), Q6(d.xMin * N + k, -d.yMin * N + O, W), Q6(d.xMax * N + k, -d.yMin * N + O, W)];
-        for (let n = 0;n < c.length; n++) {
-          let e = c[n];
+        let d = l.bounds, o = [Q6(d.xMin * N + k, -d.yMax * N + O, W), Q6(d.xMax * N + k, -d.yMax * N + O, W), Q6(d.xMin * N + k, -d.yMin * N + O, W), Q6(d.xMax * N + k, -d.yMin * N + O, W)];
+        for (let n = 0;n < o.length; n++) {
+          let e = o[n];
           G = Math.min(G, e.x), Y = Math.max(Y, e.x), j = Math.min(j, e.y), E = Math.max(E, e.y);
         }
       } else {
@@ -36148,7 +36167,7 @@ function e6($, Q, Z = {}) {
   let k = l.inv, O = $.pixelMode === 2 || $.pixelMode === 3 ? 3 : $.pixelMode === 4 ? 4 : 1, h = Array(O).fill(0);
   for (let S = 0;S < v; S++)
     for (let d = 0;d < m; d++) {
-      let c = M + d + 0.5, n = T - S - 0.5, e = k[0] * c + k[2] * n + k[4], u = k[1] * c + k[3] * n + k[5], N6 = e - K - 0.5, y = q - u - 0.5;
+      let o = M + d + 0.5, n = T - S - 0.5, e = k[0] * o + k[2] * n + k[4], u = k[1] * o + k[3] * n + k[5], N6 = e - K - 0.5, y = q - u - 0.5;
       if (jK($, N6, y, O, h), $.pixelMode === 0) {
         if ((h[0] ?? 0) >= 128) {
           let g = S * f.pitch + (d >> 3), w6 = 7 - (d & 7);
@@ -36181,8 +36200,8 @@ function D8($, Q, Z = {}) {
       let f = E + v + 0.5, l = A - m - 0.5, k = x9(f, l, R), O = k.x - K - 0.5, h = q - k.y - 0.5;
       if (jK($, O, h, P, T), $.pixelMode === 0) {
         if ((T[0] ?? 0) >= 128) {
-          let d = m * M.pitch + (v >> 3), c = 7 - (v & 7);
-          M.buffer[d] |= 1 << c;
+          let d = m * M.pitch + (v >> 3), o = 7 - (v & 7);
+          M.buffer[d] |= 1 << o;
         }
       } else if ($.pixelMode === 1)
         M.buffer[m * M.pitch + v] = T[0] ?? 0;
@@ -37266,23 +37285,16 @@ function a0() {
     f$ = new Q9;
   return f$;
 }
-function c4($, Q) {
-  if ($ === "light")
-    return true;
-  if ($ === "normal")
-    return false;
-  return Q === 1;
-}
 var o9 = null;
 var TK = 0;
-function o4($) {
+function c4($) {
   if ($ <= TK && o9)
     return o9.fill(0, 0, $), o9;
   let Q = Math.max($, 4096);
   return o9 = new Uint8Array(Q), TK = Q, o9;
 }
 function PK($, Q, Z) {
-  let K = Z === 4 ? 4 : Z === 2 || Z === 3 ? 3 : Z === 0 ? 0.125 : 1, q = Z === 0 ? Math.ceil($ / 8) : Math.ceil($ * K), J = q * Q, U = o4(J);
+  let K = Z === 4 ? 4 : Z === 2 || Z === 3 ? 3 : Z === 0 ? 0.125 : 1, q = Z === 0 ? Math.ceil($ / 8) : Math.ceil($ * K), J = q * Q, U = c4(J);
   return { width: $, rows: Q, pitch: q, buffer: U.subarray(0, J), pixelMode: Z, numGrays: Z === 0 ? 2 : 256 };
 }
 var OK = new WeakMap;
@@ -37351,7 +37363,7 @@ function l$($, Q, Z, K = 0, q) {
     return null;
   return { xCoords: W, yCoords: H, flags: new Uint8Array(_), contourEnds: N };
 }
-function i4($, Q, Z, K, q) {
+function o4($, Q, Z, K, q) {
   if (Z.type !== "composite")
     return null;
   if (q > 16)
@@ -37402,11 +37414,11 @@ function vK($, Q, Z, K, q, J = 0) {
   if (y0($, K, q))
     return H.set(W, null), null;
   if (N.type === "composite" && N.instructions.length === 0) {
-    let G = i4($, Q, N, K, J);
+    let G = o4($, Q, N, K, J);
     if (G && G.xCoords.length > 0)
       return H.set(W, G), G;
   }
-  let X = r4(Q, Z, $.ctx.scale);
+  let X = s4(Q, Z, $.ctx.scale);
   if (!X)
     return H.set(W, null), null;
   let z = b0($, X);
@@ -37414,7 +37426,7 @@ function vK($, Q, Z, K, q, J = 0) {
     return H.set(W, null), null;
   return H.set(W, z), z;
 }
-function s4($) {
+function i4($) {
   if (!$.isTrueType || !$.hasHinting)
     return null;
   let Q = MK.get($);
@@ -37430,7 +37442,7 @@ function s4($) {
     h0(Q, U.instructions);
   return MK.set($, Q), Q;
 }
-function r4($, Q, Z) {
+function s4($, Q, Z) {
   let K = $.getGlyph(Q);
   if (!K || K.type === "empty")
     return null;
@@ -37491,10 +37503,10 @@ function kK($, Q, Z, K) {
     }
   }
 }
-var a4 = 256;
+var r4 = 256;
 function $8($, Q) {
   let { width: Z, height: K, scale: q, offsetX: J = 0, offsetY: U = 0, pixelMode: W = 1, fillRule: H = 0, flipY: _ = true } = Q, N = r(Z, K, W), V = a0();
-  if (V.setClip(0, 0, Z, K), K > a4) {
+  if (V.setClip(0, 0, Z, K), K > r4) {
     let X = () => F8(V, $, q, J, U, _);
     V.renderWithBands(N, X, { minY: 0, maxY: K }, H);
   } else
@@ -37502,31 +37514,31 @@ function $8($, Q) {
   return N;
 }
 function i9($, Q, Z, K) {
-  let q = K?.padding ?? 0, J = K?.pixelMode ?? 1, U = K?.hinting ?? false, W = K?.hintTarget ?? "auto", H = K?.sizeMode, _ = h$($, Z, H);
+  let q = K?.padding ?? 0, J = K?.pixelMode ?? 1, U = K?.hinting ?? false, W = K?.sizeMode, H = h$($, Z, W);
   if (U && $.hasHinting) {
-    let L = t4($, Q, _, q, J, H === "height" ? Z : _, W);
-    if (L)
-      return L;
+    let w = a4($, Q, H, q, J, W === "height" ? Z : H);
+    if (w)
+      return w;
   }
   if ($.isTrueType) {
-    let w = _ * 64 / $.unitsPerEm, L = l$($, Q, w, 0, { roundCompositeOffsets: false });
-    if (L) {
-      let A = e4(L, q, J);
-      if (A)
-        return A;
+    let E = H * 64 / $.unitsPerEm, w = l$($, Q, E, 0, { roundCompositeOffsets: false });
+    if (w) {
+      let L = t4(w, q, J);
+      if (L)
+        return L;
     }
   }
-  let N = y6($, Q);
-  if (!N)
+  let _ = y6($, Q);
+  if (!_)
     return null;
-  let V = _ / $.unitsPerEm, X = _8(N, V, true, true);
-  if (!X)
+  let N = H / $.unitsPerEm, V = _8(_, N, true, true);
+  if (!V)
     return { bitmap: r(1, 1, J), bearingX: 0, bearingY: 0 };
-  let z = X.maxX - X.minX + q * 2, G = X.maxY - X.minY + q * 2;
-  if (z <= 0 || G <= 0)
+  let X = V.maxX - V.minX + q * 2, z = V.maxY - V.minY + q * 2;
+  if (X <= 0 || z <= 0)
     return { bitmap: r(1, 1, J), bearingX: 0, bearingY: 0 };
-  let Y = -X.minX + q, j = -X.minY + q;
-  return { bitmap: $8(N, { width: z, height: G, scale: V, offsetX: Y, offsetY: j, pixelMode: J, flipY: true }), bearingX: X.minX - q, bearingY: -(X.minY - q) };
+  let G = -V.minX + q, Y = -V.minY + q;
+  return { bitmap: $8(_, { width: X, height: z, scale: N, offsetX: G, offsetY: Y, pixelMode: J, flipY: true }), bearingX: V.minX - q, bearingY: -(V.minY - q) };
 }
 function CK($, Q, Z, K, q) {
   let J = i9($, Q, Z, q);
@@ -37537,53 +37549,53 @@ function CK($, Q, Z, K, q) {
     return D8(J.bitmap, K, U);
   return e6(J.bitmap, K, U);
 }
-function t4($, Q, Z, K, q, J = Z, U = "auto") {
-  let W = s4($);
-  if (!W)
+function a4($, Q, Z, K, q, J = Z) {
+  let U = i4($);
+  if (!U)
     return null;
-  let H = Math.round(Z);
-  W.ctx.lightMode = c4(U, q), W.ctx.renderMode = q === 0 ? "mono" : q === 2 ? "lcd" : q === 3 ? "lcd_v" : "gray", W.ctx.grayscale = W.ctx.renderMode !== "mono" && !W.ctx.lightMode;
-  let _ = vK(W, $, Q, H, J);
-  if (!_)
+  let W = Math.round(Z);
+  U.ctx.lightMode = q === 1, U.ctx.renderMode = q === 0 ? "mono" : q === 2 ? "lcd" : q === 3 ? "lcd_v" : "gray", U.ctx.grayscale = U.ctx.renderMode !== "mono" && !U.ctx.lightMode;
+  let H = vK(U, $, Q, W, J);
+  if (!H)
     return null;
-  let N = _, V = N.xCoords, X = N.yCoords, z = V[0], G = X[0], Y = V[0], j = X[0];
-  for (let l = 1;l < V.length; l++) {
-    let k = V[l], O = X[l];
+  let _ = H, N = _.xCoords, V = _.yCoords, X = N[0], z = V[0], G = N[0], Y = V[0];
+  for (let f = 1;f < N.length; f++) {
+    let l = N[f], k = V[f];
+    if (l < X)
+      X = l;
+    if (l > G)
+      G = l;
     if (k < z)
       z = k;
     if (k > Y)
       Y = k;
-    if (O < G)
-      G = O;
-    if (O > j)
-      j = O;
   }
-  if (!Number.isFinite(z))
+  if (!Number.isFinite(X))
     return { bitmap: r(1, 1, q), bearingX: 0, bearingY: 0 };
-  let E = $.getGlyphBounds(Q);
-  if (E) {
-    let l = Z / $.unitsPerEm, k = (E.xMax - E.xMin) * l, O = (E.yMax - E.yMin) * l, h = Math.max(k * 8, Z * 8, k + 64), S = Math.max(O * 8, Z * 8, O + 64), d = (Y - z) / 64, c = (j - G) / 64;
-    if (d > h || c > S)
+  let j = $.getGlyphBounds(Q);
+  if (j) {
+    let f = Z / $.unitsPerEm, l = (j.xMax - j.xMin) * f, k = (j.yMax - j.yMin) * f, O = Math.max(l * 8, Z * 8, l + 64), h = Math.max(k * 8, Z * 8, k + 64), S = (G - X) / 64, d = (Y - z) / 64;
+    if (S > O || d > h)
       return null;
   }
-  let w = Math.floor(z / 64), L = Math.floor(G / 64), A = Math.floor((Y + 63) / 64), D = Math.floor((j + 63) / 64), F = A - w + K * 2, M = D - L + K * 2;
-  if (F <= 0 || M <= 0)
+  let E = Math.floor(X / 64), w = Math.floor(z / 64), L = Math.floor((G + 63) / 64), A = Math.floor((Y + 63) / 64), D = L - E + K * 2, F = A - w + K * 2;
+  if (D <= 0 || F <= 0)
     return { bitmap: r(1, 1, q), bearingX: 0, bearingY: 0 };
-  let R = PK(F, M, q), P = a0();
-  P.setClip(0, 0, F, M), P.setBandBounds(0, M), P.reset();
-  let T = -w + K, m = D + K, v = () => kK(P, N, T, m);
+  let M = PK(D, F, q), R = a0();
+  R.setClip(0, 0, D, F), R.setBandBounds(0, F), R.reset();
+  let P = -E + K, T = A + K, m = () => kK(R, _, P, T);
   try {
-    v(), P.sweep(R, 0);
-  } catch (l) {
-    if (l instanceof g8)
-      P.reset(), P.renderWithBands(R, v, { minY: 0, maxY: M, minX: 0, maxX: F }, 0);
+    m(), R.sweep(M, 0);
+  } catch (f) {
+    if (f instanceof g8)
+      R.reset(), R.renderWithBands(M, m, { minY: 0, maxY: F, minX: 0, maxX: D }, 0);
     else
-      throw l;
+      throw f;
   }
-  let f = r(F, M, q);
-  return f.buffer.set(R.buffer), { bitmap: f, bearingX: w - K, bearingY: D + K };
+  let v = r(D, F, q);
+  return v.buffer.set(M.buffer), { bitmap: v, bearingX: E - K, bearingY: A + K };
 }
-function e4($, Q, Z) {
+function t4($, Q, Z) {
   let { xCoords: K, yCoords: q } = $;
   if (K.length === 0)
     return null;
@@ -37697,23 +37709,23 @@ function r9($) {
 }
 G6();
 function t0($, Q, Z) {
-  let { fontSize: K, sizeMode: q, padding: J = 1, maxWidth: U = 2048, maxHeight: W = 2048, pixelMode: H = 1, hintTarget: _ = "auto" } = Z, N = [], V = U9($, K, q);
-  for (let E = 0;E < Q.length; E++) {
-    let w = Q[E], L = i9($, w, K, { padding: 0, pixelMode: H, hintTarget: _, sizeMode: q });
-    if (!L)
+  let { fontSize: K, sizeMode: q, padding: J = 1, maxWidth: U = 2048, maxHeight: W = 2048, pixelMode: H = 1 } = Z, _ = [], N = U9($, K, q);
+  for (let j = 0;j < Q.length; j++) {
+    let E = Q[j], w = i9($, E, K, { padding: 0, pixelMode: H, sizeMode: q });
+    if (!w)
       continue;
-    let A = $.advanceWidth(w) * V;
-    N.push({ glyphId: w, bitmap: L.bitmap, bearingX: L.bearingX, bearingY: L.bearingY, advance: A });
+    let L = $.advanceWidth(E) * N;
+    _.push({ glyphId: E, bitmap: w.bitmap, bearingX: w.bearingX, bearingY: w.bearingY, advance: L });
   }
-  N.sort((E, w) => w.bitmap.rows - E.bitmap.rows);
-  let { width: X, height: z, placements: G } = $_(N.map((E) => ({ width: E.bitmap.width + J * 2, height: E.bitmap.rows + J * 2 })), U, W), Y = r(X, z, H), j = new Map;
-  for (let E = 0;E < N.length; E++) {
-    let w = N[E], L = G[E];
-    if (!L.placed)
+  _.sort((j, E) => E.bitmap.rows - j.bitmap.rows);
+  let { width: V, height: X, placements: z } = e4(_.map((j) => ({ width: j.bitmap.width + J * 2, height: j.bitmap.rows + J * 2 })), U, W), G = r(V, X, H), Y = new Map;
+  for (let j = 0;j < _.length; j++) {
+    let E = _[j], w = z[j];
+    if (!w.placed)
       continue;
-    Q_(w.bitmap, Y, L.x + J, L.y + J), j.set(w.glyphId, { glyphId: w.glyphId, atlasX: L.x + J, atlasY: L.y + J, width: w.bitmap.width, height: w.bitmap.rows, bearingX: w.bearingX, bearingY: w.bearingY, advance: w.advance });
+    $_(E.bitmap, G, w.x + J, w.y + J), Y.set(E.glyphId, { glyphId: E.glyphId, atlasX: w.x + J, atlasY: w.y + J, width: E.bitmap.width, height: E.bitmap.rows, bearingX: E.bearingX, bearingY: E.bearingY, advance: E.advance });
   }
-  return { bitmap: Y, glyphs: j, fontSize: K };
+  return { bitmap: G, glyphs: Y, fontSize: K };
 }
 function yK($, Q) {
   let Z = [];
@@ -37736,7 +37748,7 @@ function bK($, Q, Z) {
   }
   return t0($, [...K], Z);
 }
-function $_($, Q, Z) {
+function e4($, Q, Z) {
   let K = [], q = [], J = 0, U = 0;
   for (let _ = 0;_ < $.length; _++) {
     let N = $[_], V = false, X = -1, z = Z;
@@ -37761,7 +37773,7 @@ function $_($, Q, Z) {
   let W = hK(J), H = hK(U);
   return { width: Math.min(W, Q), height: Math.min(H, Z), placements: q };
 }
-function Q_($, Q, Z, K) {
+function $_($, Q, Z, K) {
   let q = $.pixelMode === 2 ? 3 : 1;
   for (let J = 0;J < $.rows; J++) {
     let U = J * $.pitch, W = (K + J) * Q.pitch + Z * q;
@@ -37801,10 +37813,10 @@ function uK($, Q) {
   return { u0: Z.atlasX / K.width, v0: Z.atlasY / K.rows, u1: (Z.atlasX + Z.width) / K.width, v1: (Z.atlasY + Z.height) / K.rows };
 }
 G6();
-function Z_($, Q, Z) {
+function Q_($, Q, Z) {
   return Math.max(Math.min($, Q), Math.min(Math.max($, Q), Z));
 }
-function K_($, Q, Z, K) {
+function Z_($, Q, Z, K) {
   let q = K.x - Z.x, J = K.y - Z.y, U = q * q + J * J;
   if (U < 0.0000000001)
     return { distance: Math.sqrt(($ - Z.x) ** 2 + (Q - Z.y) ** 2), t: 0 };
@@ -37813,14 +37825,14 @@ function K_($, Q, Z, K) {
   let H = Math.sqrt(($ - Z.x - W * q) ** 2 + (Q - Z.y - W * J) ** 2);
   return { distance: (q * (Q - Z.y) - J * ($ - Z.x) >= 0 ? 1 : -1) * H, t: W };
 }
-function q_($, Q, Z, K) {
+function K_($, Q, Z, K) {
   let q = K.x - Z.x, J = K.y - Z.y, U = q * q + J * J;
   if (U < 0.0000000001)
     return Math.sqrt(($ - Z.x) ** 2 + (Q - Z.y) ** 2);
   let W = (($ - Z.x) * q + (Q - Z.y) * J) / U;
   return W = Math.max(0, Math.min(1, W)), Math.sqrt(($ - Z.x - W * q) ** 2 + (Q - Z.y - W * J) ** 2);
 }
-function J_($, Q, Z, K, q) {
+function q_($, Q, Z, K, q) {
   let J = Z.x - 2 * K.x + q.x, U = Z.y - 2 * K.y + q.y, W = Math.min(Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2), Math.sqrt((q.x - $) ** 2 + (q.y - Q) ** 2)), H = W === Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2) ? 0 : 1;
   for (let j = 1;j < 6; j++) {
     let E = j / 6;
@@ -37837,7 +37849,7 @@ function J_($, Q, Z, K, q) {
   let _ = 1 - H, N = 2 * (_ * (K.x - Z.x) + H * (q.x - K.x)), V = 2 * (_ * (K.y - Z.y) + H * (q.y - K.y)), X = _ * _ * Z.x + 2 * _ * H * K.x + H * H * q.x, z = _ * _ * Z.y + 2 * _ * H * K.y + H * H * q.y;
   return { distance: (N * (Q - z) - V * ($ - X) >= 0 ? 1 : -1) * W, t: H };
 }
-function U_($, Q, Z, K, q) {
+function J_($, Q, Z, K, q) {
   let J = Z.x - 2 * K.x + q.x, U = Z.y - 2 * K.y + q.y, W = Math.min(Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2), Math.sqrt((q.x - $) ** 2 + (q.y - Q) ** 2));
   for (let H = 1;H < 6; H++) {
     let _ = H / 6;
@@ -37853,12 +37865,12 @@ function U_($, Q, Z, K, q) {
   }
   return W;
 }
-function W_($, Q, Z, K, q, J) {
+function U_($, Q, Z, K, q, J) {
   let U = Math.min(Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2), Math.sqrt((J.x - $) ** 2 + (J.y - Q) ** 2)), W = U === Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2) ? 0 : 1;
   for (let L = 1;L < 6; L++) {
     let A = L / 6;
     for (let f = 0;f < 3; f++) {
-      let l = 1 - A, k = l * l, O = k * l, h = A * A, S = h * A, d = O * Z.x + 3 * k * A * K.x + 3 * l * h * q.x + S * J.x, c = O * Z.y + 3 * k * A * K.y + 3 * l * h * q.y + S * J.y, n = 3 * k * (K.x - Z.x) + 6 * l * A * (q.x - K.x) + 3 * h * (J.x - q.x), e = 3 * k * (K.y - Z.y) + 6 * l * A * (q.y - K.y) + 3 * h * (J.y - q.y), u = 6 * l * (q.x - 2 * K.x + Z.x) + 6 * A * (J.x - 2 * q.x + K.x), N6 = 6 * l * (q.y - 2 * K.y + Z.y) + 6 * A * (J.y - 2 * q.y + K.y), y = d - $, t = c - Q, g = y * n + t * e, w6 = n * n + e * e + y * u + t * N6;
+      let l = 1 - A, k = l * l, O = k * l, h = A * A, S = h * A, d = O * Z.x + 3 * k * A * K.x + 3 * l * h * q.x + S * J.x, o = O * Z.y + 3 * k * A * K.y + 3 * l * h * q.y + S * J.y, n = 3 * k * (K.x - Z.x) + 6 * l * A * (q.x - K.x) + 3 * h * (J.x - q.x), e = 3 * k * (K.y - Z.y) + 6 * l * A * (q.y - K.y) + 3 * h * (J.y - q.y), u = 6 * l * (q.x - 2 * K.x + Z.x) + 6 * A * (J.x - 2 * q.x + K.x), N6 = 6 * l * (q.y - 2 * K.y + Z.y) + 6 * A * (J.y - 2 * q.y + K.y), y = d - $, t = o - Q, g = y * n + t * e, w6 = n * n + e * e + y * u + t * N6;
       if (Math.abs(w6) < 0.0000000001)
         break;
       A = Math.max(0, Math.min(1, A - g / w6));
@@ -37870,7 +37882,7 @@ function W_($, Q, Z, K, q, J) {
   let H = 1 - W, _ = H * H, N = W * W, V = 3 * _ * (K.x - Z.x) + 6 * H * W * (q.x - K.x) + 3 * N * (J.x - q.x), X = 3 * _ * (K.y - Z.y) + 6 * H * W * (q.y - K.y) + 3 * N * (J.y - q.y), z = _ * H, G = N * W, Y = z * Z.x + 3 * _ * W * K.x + 3 * H * N * q.x + G * J.x, j = z * Z.y + 3 * _ * W * K.y + 3 * H * N * q.y + G * J.y;
   return { distance: (V * (Q - j) - X * ($ - Y) >= 0 ? 1 : -1) * U, t: W };
 }
-function H_($, Q, Z, K, q, J) {
+function W_($, Q, Z, K, q, J) {
   let U = Math.min(Math.sqrt((Z.x - $) ** 2 + (Z.y - Q) ** 2), Math.sqrt((J.x - $) ** 2 + (J.y - Q) ** 2));
   for (let W = 1;W < 6; W++) {
     let H = W / 6;
@@ -37912,11 +37924,11 @@ function lK($) {
     return { x: 0, y: 0 };
   return { x: $.x / Q, y: $.y / Q };
 }
-function __($, Q) {
+function H_($, Q) {
   return $.x * Q.x + $.y * Q.y;
 }
 function dK($, Q, Z = Math.PI / 3) {
-  let K = lK($), q = lK(Q), J = __(K, q), U = Math.acos(Math.max(-1, Math.min(1, J)));
+  let K = lK($), q = lK(Q), J = H_(K, q), U = Math.acos(Math.max(-1, Math.min(1, J)));
   return U > Z && U < Math.PI - Z;
 }
 function pK($) {
@@ -37956,7 +37968,7 @@ function pK($) {
     }
   }
 }
-function N_($, Q, Z, K, q) {
+function __($, Q, Z, K, q) {
   let J = [], U = [], W = null, H = null, _ = (N, V) => ({ x: N * Q + Z, y: q ? -(V * Q) + K : V * Q + K });
   for (let N = 0;N < $.commands.length; N++) {
     let V = $.commands[N];
@@ -38001,17 +38013,17 @@ function N_($, Q, Z, K, q) {
     J.push(U);
   return J;
 }
-function V_($, Q, Z) {
+function N_($, Q, Z) {
   switch (Z.type) {
     case "line":
-      return q_($, Q, Z.p0, Z.p1);
+      return K_($, Q, Z.p0, Z.p1);
     case "quadratic":
-      return U_($, Q, Z.p0, Z.p1, Z.p2);
+      return J_($, Q, Z.p0, Z.p1, Z.p2);
     case "cubic":
-      return H_($, Q, Z.p0, Z.p1, Z.p2, Z.p3);
+      return W_($, Q, Z.p0, Z.p1, Z.p2, Z.p3);
   }
 }
-function X_($) {
+function V_($) {
   let Q = [];
   for (let Z = 0;Z < $.length; Z++) {
     let K = $[Z], q = [];
@@ -38037,7 +38049,7 @@ function X_($) {
   }
   return Q;
 }
-function z_($, Q, Z) {
+function X_($, Q, Z) {
   let K = 0;
   for (let q = 0;q < Z.length; q++) {
     let J = Z[q];
@@ -38058,7 +38070,7 @@ function d$($, Q, Z) {
     let J = Z[q], U = $ < J.minX ? J.minX - $ : $ > J.maxX ? $ - J.maxX : 0, W = Q < J.minY ? J.minY - Q : Q > J.maxY ? Q - J.maxY : 0;
     if (U * U + W * W >= K * K)
       continue;
-    let H = V_($, Q, J);
+    let H = N_($, Q, J);
     if (H < K) {
       if (K = H, H < 0.5)
         break;
@@ -38067,14 +38079,14 @@ function d$($, Q, Z) {
   return K;
 }
 function l8($, Q) {
-  let { width: Z, height: K, scale: q, offsetX: J = 0, offsetY: U = 0, flipY: W = false, spread: H = 8 } = Q, _ = r(Z, K, 2), N = N_($, q, J, U, W);
+  let { width: Z, height: K, scale: q, offsetX: J = 0, offsetY: U = 0, flipY: W = false, spread: H = 8 } = Q, _ = r(Z, K, 2), N = __($, q, J, U, W);
   if (N.length === 0 || N.every((L) => L.length === 0))
     return _.buffer.fill(0), _;
   pK(N);
-  let V = X_(N), X = N.flat(), z = X.filter((L) => L.color === 0), G = X.filter((L) => L.color === 1), Y = X.filter((L) => L.color === 2), j = z.length > 0 ? z : X, E = G.length > 0 ? G : X, w = Y.length > 0 ? Y : X;
+  let V = V_(N), X = N.flat(), z = X.filter((L) => L.color === 0), G = X.filter((L) => L.color === 1), Y = X.filter((L) => L.color === 2), j = z.length > 0 ? z : X, E = G.length > 0 ? G : X, w = Y.length > 0 ? Y : X;
   for (let L = 0;L < K; L++)
     for (let A = 0;A < Z; A++) {
-      let D = A + 0.5, F = L + 0.5, M = d$(D, F, j), R = d$(D, F, E), P = d$(D, F, w), m = z_(D, F, V) ? 1 : -1, v = M * m, f = R * m, l = P * m, k = (h) => {
+      let D = A + 0.5, F = L + 0.5, M = d$(D, F, j), R = d$(D, F, E), P = d$(D, F, w), m = X_(D, F, V) ? 1 : -1, v = M * m, f = R * m, l = P * m, k = (h) => {
         let S = 128 + h / H * 127;
         return Math.max(0, Math.min(255, Math.round(S)));
       }, O = L * _.pitch + A * 3;
@@ -38082,7 +38094,7 @@ function l8($, Q) {
     }
   return _;
 }
-function G_($, Q, Z) {
+function z_($, Q, Z) {
   let K = [], q = [], J = 0, U = 0;
   for (let _ = 0;_ < $.length; _++) {
     let N = $[_], V = false, X = -1, z = Z;
@@ -38112,7 +38124,7 @@ function nK($) {
     return 1;
   return $--, $ |= $ >> 1, $ |= $ >> 2, $ |= $ >> 4, $ |= $ >> 8, $ |= $ >> 16, $ + 1;
 }
-function Y_($, Q, Z, K) {
+function G_($, Q, Z, K) {
   for (let q = 0;q < $.rows; q++) {
     let J = q * $.pitch, U = (K + q) * Q.pitch + Z * 3;
     for (let W = 0;W < $.width * 3; W++)
@@ -38132,12 +38144,12 @@ function e0($, Q, Z) {
     N.push({ glyphId: E, bitmap: F, bearingX: R, bearingY: P, advance: M });
   }
   N.sort((j, E) => E.bitmap.rows - j.bitmap.rows);
-  let { width: V, height: X, placements: z } = G_(N.map((j) => ({ width: j.bitmap.width + J * 2, height: j.bitmap.rows + J * 2 })), U, W), G = r(V, X, 2), Y = new Map;
+  let { width: V, height: X, placements: z } = z_(N.map((j) => ({ width: j.bitmap.width + J * 2, height: j.bitmap.rows + J * 2 })), U, W), G = r(V, X, 2), Y = new Map;
   for (let j = 0;j < N.length; j++) {
     let E = N[j], w = z[j];
     if (!w.placed)
       continue;
-    Y_(E.bitmap, G, w.x + J, w.y + J), Y.set(E.glyphId, { glyphId: E.glyphId, atlasX: w.x + J, atlasY: w.y + J, width: E.bitmap.width, height: E.bitmap.rows, bearingX: E.bearingX, bearingY: E.bearingY, advance: E.advance });
+    G_(E.bitmap, G, w.x + J, w.y + J), Y.set(E.glyphId, { glyphId: E.glyphId, atlasX: w.x + J, atlasY: w.y + J, width: E.bitmap.width, height: E.bitmap.rows, bearingX: E.bearingX, bearingY: E.bearingY, advance: E.advance });
   }
   return { bitmap: G, glyphs: Y, fontSize: K };
 }
@@ -38182,9 +38194,9 @@ function sK($) {
   return Z;
 }
 G6();
-var j_ = Math.PI;
-function E_($, Q, Z) {
-  let K = 0.5 / Z, q = Math.exp(-K), J = q * q, U = Math.sqrt(K / j_);
+var Y_ = Math.PI;
+function j_($, Q, Z) {
+  let K = 0.5 / Z, q = Math.exp(-K), J = q * q, U = Math.sqrt(K / Y_);
   $[0] = U, U *= q, $[1] = U;
   for (let W = 2;W < Q; W++)
     q *= J, U *= q, $[W] = U;
@@ -38196,7 +38208,7 @@ function rK($, Q, Z) {
     J = q, q = K, K = $[U], $[U] = W;
   }
 }
-function w_($, Q, Z) {
+function E_($, Q, Z) {
   for (let K = 0;K < Z; K++) {
     $[K][K] = Q[2 * K + 2] + 3 * Q[0] - 4 * Q[K + 1];
     for (let q = K + 1;q < Z; q++)
@@ -38217,15 +38229,15 @@ function w_($, Q, Z) {
       $[K][J] *= q;
   }
 }
-function A_($, Q, Z, K) {
+function w_($, Q, Z, K) {
   let J = [((0.27116402116402116 * K + 0.09027777777777778) * K + 0.20833333333333334) * K + 0.43022486772486773, ((-0.20337301587301587 * K - 0.022569444444444444) * K - 0.017361111111111112) * K + 0.24330357142857142, ((0.08134920634920635 * K - 0.04513888888888889) * K - 0.0763888888888889) * K + 0.04017857142857143, ((-0.013558201058201057 * K + 0.022569444444444444) * K - 0.010416666666666666) * K + 0.0014054232804232803], U = new Float64Array(17);
   U[0] = J[0], U[1] = J[1], U[2] = J[2], U[3] = J[3], rK(U, 7, J);
   let W = new Float64Array(12);
-  E_(W, Q + 4, Z * K), rK(W, Q + 1, J);
+  j_(W, Q + 4, Z * K), rK(W, Q + 1, J);
   let H = [];
   for (let N = 0;N < 8; N++)
     H.push(new Float64Array(8));
-  w_(H, U, Q);
+  E_(H, U, Q);
   let _ = new Float64Array(8);
   for (let N = 0;N < Q; N++)
     _[N] = U[0] - U[N + 1] - W[0] + W[N + 1];
@@ -38244,14 +38256,14 @@ function aK($) {
     let J = Math.sqrt(0.11569 * $ + 0.20591047);
     Z = Math.floor(Math.log2(J)) + 1;
     let U = J / 2 ** (Z - 1) - 1, W = 0.25 ** Z;
-    K = 8 - Math.floor((10.1525 + 0.8335 * W) * (1 - U)), K = Math.max(K, 4), K = Math.min(K, 8), A_(Q, K, $, W);
+    K = 8 - Math.floor((10.1525 + 0.8335 * W) * (1 - U)), K = Math.max(K, 4), K = Math.min(K, 8), w_(Q, K, $, W);
   }
   let q = new Float32Array(8);
   for (let J = 0;J < K; J++)
     q[J] = Q[J];
   return { level: Z, radius: K, coeff: q };
 }
-function L_($, Q, Z, K, q, J) {
+function A_($, Q, Z, K, q, J) {
   let U = Math.floor((Z + 5) / 2);
   for (let W = 0;W < K; W++) {
     let H = W * q, _ = W * J;
@@ -38261,7 +38273,7 @@ function L_($, Q, Z, K, q, J) {
     }
   }
 }
-function F_($, Q, Z, K, q, J) {
+function L_($, Q, Z, K, q, J) {
   let U = Math.floor((K + 5) / 2);
   for (let W = 0;W < Z; W++)
     for (let H = 0;H < U; H++) {
@@ -38269,7 +38281,7 @@ function F_($, Q, Z, K, q, J) {
       N += (Q[Math.max(0, _ - 2) * q + W] ?? 0) * 1, N += (Q[Math.max(0, _ - 1) * q + W] ?? 0) * 5, N += (Q[Math.min(K - 1, _) * q + W] ?? 0) * 10, N += (Q[Math.min(K - 1, _ + 1) * q + W] ?? 0) * 10, N += (Q[Math.min(K - 1, _ + 2) * q + W] ?? 0) * 5, N += (Q[Math.min(K - 1, _ + 3) * q + W] ?? 0) * 1, $[H * J + W] = N / 32;
     }
 }
-function D_($, Q, Z, K, q, J) {
+function F_($, Q, Z, K, q, J) {
   let U = Z * 2 + 4;
   for (let W = 0;W < K; W++) {
     let H = W * q, _ = W * J;
@@ -38283,7 +38295,7 @@ function D_($, Q, Z, K, q, J) {
     }
   }
 }
-function B_($, Q, Z, K, q, J) {
+function D_($, Q, Z, K, q, J) {
   let U = K * 2 + 4;
   for (let W = 0;W < Z; W++)
     for (let H = 0;H < U; H++) {
@@ -38295,7 +38307,7 @@ function B_($, Q, Z, K, q, J) {
       $[H * J + W] = V / 32;
     }
 }
-function R_($, Q, Z, K, q, J, U, W) {
+function B_($, Q, Z, K, q, J, U, W) {
   let H = Z + 2 * U;
   for (let _ = 0;_ < K; _++) {
     let N = _ * q, V = _ * J;
@@ -38309,7 +38321,7 @@ function R_($, Q, Z, K, q, J, U, W) {
     }
   }
 }
-function M_($, Q, Z, K, q, J, U, W) {
+function R_($, Q, Z, K, q, J, U, W) {
   let H = K + 2 * U;
   for (let _ = 0;_ < Z; _++)
     for (let N = 0;N < H; N++) {
@@ -38321,7 +38333,7 @@ function M_($, Q, Z, K, q, J, U, W) {
       $[N * J + _] = X;
     }
 }
-function T_($, Q, Z) {
+function M_($, Q, Z) {
   let K = (Q + Z) / 2;
   return i6($, K);
 }
@@ -38329,7 +38341,7 @@ function d8($, Q, Z = Q) {
   if (Q <= 0 && Z <= 0)
     return $;
   if ($.pixelMode === 4)
-    return T_($, Q, Z);
+    return M_($, Q, Z);
   let K = Q * Q, q = Z * Z, J = aK(K), U = aK(q), W = $.width, H = $.rows, _ = (2 * J.radius + 9 << J.level) - 5, N = (2 * U.radius + 9 << U.level) - 5, V = (W + _ & ~((1 << J.level) - 1)) - 4, X = (H + N & ~((1 << U.level) - 1)) - 4, z = Math.max(W * H, V * X) * 2, G = new Float32Array(z), Y = new Float32Array(z);
   for (let R = 0;R < H; R++)
     for (let P = 0;P < W; P++)
@@ -38337,23 +38349,23 @@ function d8($, Q, Z = Q) {
   let j = G, E = Y, w = W;
   for (let R = 0;R < U.level; R++) {
     let P = Math.floor((H + 5) / 2);
-    F_(E, j, W, H, w, W), H = P, [j, E] = [E, j];
+    L_(E, j, W, H, w, W), H = P, [j, E] = [E, j];
   }
   for (let R = 0;R < J.level; R++) {
     let P = Math.floor((W + 5) / 2);
-    L_(E, j, W, H, w, P), W = P, w = P, [j, E] = [E, j];
+    A_(E, j, W, H, w, P), W = P, w = P, [j, E] = [E, j];
   }
   let L = W + 2 * J.radius;
-  R_(E, j, W, H, w, L, J.radius, J.coeff), W = L, w = L, [j, E] = [E, j];
+  B_(E, j, W, H, w, L, J.radius, J.coeff), W = L, w = L, [j, E] = [E, j];
   let A = H + 2 * U.radius;
-  M_(E, j, W, H, w, w, U.radius, U.coeff), H = A, [j, E] = [E, j];
+  R_(E, j, W, H, w, w, U.radius, U.coeff), H = A, [j, E] = [E, j];
   for (let R = 0;R < J.level; R++) {
     let P = W * 2 + 4;
-    D_(E, j, W, H, w, P), W = P, w = P, [j, E] = [E, j];
+    F_(E, j, W, H, w, P), W = P, w = P, [j, E] = [E, j];
   }
   for (let R = 0;R < U.level; R++) {
     let P = H * 2 + 4;
-    B_(E, j, W, H, w, w), H = P, [j, E] = [E, j];
+    D_(E, j, W, H, w, w), H = P, [j, E] = [E, j];
   }
   let D = Math.min(W, V), F = Math.min(H, X), M = new Uint8Array(D * F);
   for (let R = 0;R < F; R++)
@@ -38898,10 +38910,10 @@ function dq($) {
 function nq($) {
   return U6($);
 }
-function O_($, Q) {
+function T_($, Q) {
   return q6.fromGlyph($, Q);
 }
-function P_($, Q) {
+function O_($, Q) {
   let Z = Q.codePointAt(0);
   if (Z === undefined)
     return null;
@@ -38910,16 +38922,16 @@ function P_($, Q) {
     return null;
   return q6.fromGlyph($, K);
 }
-function I_($, Q, Z) {
+function P_($, Q, Z) {
   return q6.fromGlyphWithVariation($, Q, Z);
 }
-function v_($) {
+function I_($) {
   return q6.fromPath($);
 }
-function k_($) {
+function v_($) {
   return i.fromBitmap($);
 }
-function C_(...$) {
+function k_(...$) {
   return q6.combine(...$);
 }
 
@@ -39156,10 +39168,10 @@ function p$($, Q) {
   return 0;
 }
 function iq($) {
-  let Q = $.uint16(), Z = $.uint16(), K = $.offset32(), q = $.offset32(), J = $.offset32(), U = $.offset32(), W = S_($.sliceFrom(K)), H = q !== 0 ? c$($.sliceFrom(q)) : null, _ = J !== 0 ? c$($.sliceFrom(J)) : null, N = U !== 0 ? c$($.sliceFrom(U)) : null;
+  let Q = $.uint16(), Z = $.uint16(), K = $.offset32(), q = $.offset32(), J = $.offset32(), U = $.offset32(), W = C_($.sliceFrom(K)), H = q !== 0 ? c$($.sliceFrom(q)) : null, _ = J !== 0 ? c$($.sliceFrom(J)) : null, N = U !== 0 ? c$($.sliceFrom(U)) : null;
   return { majorVersion: Q, minorVersion: Z, itemVariationStore: W, advanceWidthMapping: H, lsbMapping: _, rsbMapping: N };
 }
-function S_($) {
+function C_($) {
   let Q = $.uint16(), Z = $.offset32(), K = $.uint16(), q = [];
   for (let N = 0;N < K; N++)
     q.push($.offset32());
@@ -39388,7 +39400,7 @@ class n8 {
     return this.font.hhea;
   }
 }
-function h_($, Q) {
+function S_($, Q) {
   return new n8($, Q);
 }
 var aq = 1953784678;
@@ -39414,7 +39426,7 @@ function s$($) {
   }
   return { version: K, numFonts: q, offsets: U };
 }
-var r_ = ["cmap", "head", "hhea", "hmtx", "maxp", "name", "OS/2", "post", "cvt ", "fpgm", "glyf", "loca", "prep", "CFF ", "VORG", "EBDT", "EBLC", "gasp", "hdmx", "kern", "LTSH", "PCLT", "VDMX", "vhea", "vmtx", "BASE", "GDEF", "GPOS", "GSUB", "EBSC", "JSTF", "MATH", "CBDT", "CBLC", "COLR", "CPAL", "SVG ", "sbix", "acnt", "avar", "bdat", "bloc", "bsln", "cvar", "fdsc", "feat", "fmtx", "fvar", "gvar", "hsty", "just", "lcar", "mort", "morx", "opbd", "prop", "trak", "Zapf", "Silf", "Glat", "Gloc", "Feat", "Sill"];
+var s_ = ["cmap", "head", "hhea", "hmtx", "maxp", "name", "OS/2", "post", "cvt ", "fpgm", "glyf", "loca", "prep", "CFF ", "VORG", "EBDT", "EBLC", "gasp", "hdmx", "kern", "LTSH", "PCLT", "VDMX", "vhea", "vmtx", "BASE", "GDEF", "GPOS", "GSUB", "EBSC", "JSTF", "MATH", "CBDT", "CBLC", "COLR", "CPAL", "SVG ", "sbix", "acnt", "avar", "bdat", "bloc", "bsln", "cvar", "fdsc", "feat", "fmtx", "fvar", "gvar", "hsty", "just", "lcar", "mort", "morx", "opbd", "prop", "trak", "Zapf", "Silf", "Glat", "Gloc", "Feat", "Sill"];
 function GJ($, Q) {
   let Z = 0;
   for (let K = 0;K < 5; K++) {
@@ -39439,14 +39451,14 @@ function q1($, Q) {
     return $[Q.value++] + 253;
   return Z;
 }
-function a_($, Q, Z) {
+function r_($, Q, Z) {
   let K = [];
   for (let q = 0;q < Z; q++) {
     let J = $[Q.value++], U = J & 63, W = J >> 6 & 3, H;
     if (U === 63)
       H = String.fromCharCode($[Q.value++], $[Q.value++], $[Q.value++], $[Q.value++]);
     else
-      H = r_[U];
+      H = s_[U];
     let _ = GJ($, Q), N = _;
     if (H === "glyf" || H === "loca" ? W === 0 : W !== 0)
       N = GJ($, Q);
@@ -39454,13 +39466,12 @@ function a_($, Q, Z) {
   }
   return K;
 }
-async function t_($) {
+async function a_($) {
   if (typeof DecompressionStream < "u")
     try {
       let Z = new DecompressionStream("brotli"), q = new Blob([$.buffer]).stream().pipeThrough(Z), J = await new Response(q).arrayBuffer();
       return new Uint8Array(J);
-    } catch {
-    }
+    } catch {}
   let { decompress: Q } = await Promise.resolve().then(() => (zJ(), XJ));
   return Q($);
 }
@@ -39491,7 +39502,7 @@ function YJ($, Q, Z) {
 function K5($) {
   return $ + 3 & -4;
 }
-function e_($, Q, Z, K, q) {
+function t_($, Q, Z, K, q) {
   let J = [], U = 0, W = 0;
   function H(_, N) {
     return _ & 1 ? N : -N;
@@ -39517,7 +39528,7 @@ function e_($, Q, Z, K, q) {
   }
   return J;
 }
-function $N($, Q, Z) {
+function e_($, Q, Z) {
   let K = 0, q = M8($, K);
   if (K += 2, q !== 0)
     throw Error(`Unsupported glyf transform version: ${q}`);
@@ -39554,40 +39565,40 @@ function $N($, Q, Z) {
   let A = $.slice(K, K + z);
   K += z;
   let D = $.slice(K, K + G), F = { value: 0 }, M = { value: 0 }, R = { value: 0 }, P = { value: 0 }, T = { value: 0 }, m = { value: 0 }, v = { value: 0 }, f = [0], l = [], k = 0;
-  for (let c = 0;c < Q; c++) {
+  for (let o = 0;o < Q; o++) {
     let n = Q8(Y, F.value);
     if (F.value += 2, n === 0) {
       l.push(new Uint8Array(0)), f.push(k);
       continue;
     }
     if (n > 0) {
-      let e = QN(n, j, M, E, R, w, P, A, m, D, v, J);
+      let e = $N(n, j, M, E, R, w, P, A, m, D, v, J);
       l.push(e), k += K5(e.length), f.push(k);
     } else {
-      let e = ZN(L, T, A, m, D, v, J);
+      let e = QN(L, T, A, m, D, v, J);
       l.push(e), k += K5(e.length), f.push(k);
     }
   }
   let O = new Uint8Array(k), h = 0;
-  for (let c = 0;c < l.length; c++) {
-    let n = l[c];
+  for (let o = 0;o < l.length; o++) {
+    let n = l[o];
     O.set(n, h), h += K5(n.length);
   }
   let S = Z === 0 ? (Q + 1) * 2 : (Q + 1) * 4, d = new Uint8Array(S);
-  for (let c = 0;c <= Q; c++)
+  for (let o = 0;o <= Q; o++)
     if (Z === 0)
-      n6(d, c * 2, f[c] / 2);
+      n6(d, o * 2, f[o] / 2);
     else
-      X9(d, c * 4, f[c]);
+      X9(d, o * 4, f[o]);
   return { glyf: O, loca: d };
 }
-function QN($, Q, Z, K, q, J, U, W, H, _, N, V) {
+function $N($, Q, Z, K, q, J, U, W, H, _, N, V) {
   let X = [], z = 0;
   for (let h = 0;h < $; h++) {
     let S = q1(Q, Z);
     z += S, X.push(z - 1);
   }
-  let G = e_(K, J, z, q, U), Y, j, E, w;
+  let G = t_(K, J, z, q, U), Y, j, E, w;
   if ((V & 1) === 0 && H.value + 8 <= W.length)
     Y = Q8(W, H.value), H.value += 2, j = Q8(W, H.value), H.value += 2, E = Q8(W, H.value), H.value += 2, w = Q8(W, H.value), H.value += 2;
   else {
@@ -39606,7 +39617,7 @@ function QN($, Q, Z, K, q, J, U, W, H, _, N, V) {
   }
   let T = [], m = [], v = [];
   for (let h = 0;h < z; h++) {
-    let S = G[h].onCurve ? 1 : 0, d = F[h], c = M[h];
+    let S = G[h].onCurve ? 1 : 0, d = F[h], o = M[h];
     if (d === 0)
       S |= 16;
     else if (d >= -255 && d <= 255) {
@@ -39615,14 +39626,14 @@ function QN($, Q, Z, K, q, J, U, W, H, _, N, V) {
       m.push(Math.abs(d));
     } else
       m.push(d >> 8 & 255, d & 255);
-    if (c === 0)
+    if (o === 0)
       S |= 32;
-    else if (c >= -255 && c <= 255) {
-      if (S |= 4, c > 0)
+    else if (o >= -255 && o <= 255) {
+      if (S |= 4, o > 0)
         S |= 32;
-      v.push(Math.abs(c));
+      v.push(Math.abs(o));
     } else
-      v.push(c >> 8 & 255, c & 255);
+      v.push(o >> 8 & 255, o & 255);
     T.push(S);
   }
   let l = 10 + $ * 2 + 2 + A + T.length + m.length + v.length, k = new Uint8Array(l), O = 0;
@@ -39646,7 +39657,7 @@ function QN($, Q, Z, K, q, J, U, W, H, _, N, V) {
   }
   return k.slice(0, O);
 }
-function ZN($, Q, Z, K, q, J, U) {
+function QN($, Q, Z, K, q, J, U) {
   let W = [], H = Q8(Z, K.value);
   K.value += 2;
   let _ = Q8(Z, K.value);
@@ -39687,7 +39698,7 @@ async function jJ($) {
   let Q = new Uint8Array($), Z = new DataView($);
   if (Z.getUint32(0, false) !== 2001684018)
     throw Error("Not a valid WOFF2 file");
-  let q = Z.getUint32(4, false), J = Z.getUint16(12, false), U = Z.getUint32(20, false), W = { value: 48 }, H = a_(Q, W, J), _ = Q.slice(W.value, W.value + U), N = await t_(_), V = new Map, X = 0;
+  let q = Z.getUint32(4, false), J = Z.getUint16(12, false), U = Z.getUint32(20, false), W = { value: 48 }, H = r_(Q, W, J), _ = Q.slice(W.value, W.value + U), N = await a_(_), V = new Map, X = 0;
   for (let v = 0;v < H.length; v++) {
     let f = H[v], l = N.slice(X, X + f.transformLength);
     V.set(f.tag, l), X += f.transformLength;
@@ -39700,7 +39711,7 @@ async function jJ($) {
     let v = V.get("glyf");
     if (!v)
       throw Error("Missing glyf table data for transform");
-    let { glyf: f, loca: l } = $N(v, Y, j);
+    let { glyf: f, loca: l } = e_(v, Y, j);
     if (V.set("glyf", f), V.set("loca", l), E.origLength = f.length, w)
       w.origLength = l.length;
   }
@@ -39730,7 +39741,7 @@ async function jJ($) {
   }
   return M.buffer;
 }
-var KN = { hang: 1751215719, icfb: 1768121954, icft: 1768121972, ideo: 1768187247, idtp: 1768191088, math: 1835103336, romn: 1919905134 };
+var ZN = { hang: 1751215719, icfb: 1768121954, icft: 1768121972, ideo: 1768187247, idtp: 1768191088, math: 1835103336, romn: 1919905134 };
 function Z0($) {
   let Q = $.uint16(), Z = $.int16(), K = { format: Q, coordinate: Z };
   if (Q === 2)
@@ -39766,7 +39777,7 @@ function EJ($, Q) {
   }
   return { minCoord: U, maxCoord: W, featMinMaxRecords: H };
 }
-function qN($, Q, Z) {
+function KN($, Q, Z) {
   if (Q === 0)
     return null;
   let K = $.sliceFrom(Q), q = K.uint16(), J = K.uint16(), U = [];
@@ -39783,13 +39794,13 @@ function qN($, Q, Z) {
   }
   return { defaultBaselineIndex: q, baseCoords: W };
 }
-function JN($, Q, Z) {
+function qN($, Q, Z) {
   let K = $.sliceFrom(Q), q = K.uint16(), J = K.uint16(), U = K.uint16(), W = new Map, H = [];
   for (let V = 0;V < U; V++) {
     let X = K.uint32(), z = K.uint16();
     H.push({ tag: X, offset: z });
   }
-  let _ = qN($, Q + q, Z), N = EJ($, Q + J);
+  let _ = KN($, Q + q, Z), N = EJ($, Q + J);
   for (let V = 0;V < H.length; V++) {
     let X = H[V], z = EJ($, Q + X.offset);
     if (z)
@@ -39814,7 +39825,7 @@ function wJ($, Q) {
       _.push({ tag: V, offset: X });
     }
     for (let N = 0;N < _.length; N++) {
-      let V = _[N], X = JN($, Q + q + V.offset, J);
+      let V = _[N], X = qN($, Q + q + V.offset, J);
       U.push({ scriptTag: V.tag, ...X });
     }
   }
@@ -39824,7 +39835,7 @@ function J1($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16(), J = wJ($, K), U = wJ($, q);
   return { majorVersion: Q, minorVersion: Z, horizAxis: J, vertAxis: U };
 }
-function UN($, Q, Z, K = true) {
+function JN($, Q, Z, K = true) {
   let q = K ? $.horizAxis : $.vertAxis;
   if (!q)
     return null;
@@ -39836,7 +39847,7 @@ function UN($, Q, Z, K = true) {
     return null;
   return J.baseValues.baseCoords[U] ?? null;
 }
-function WN($, Q, Z = true) {
+function UN($, Q, Z = true) {
   let K = Z ? $.horizAxis : $.vertAxis;
   if (!K)
     return null;
@@ -39848,7 +39859,7 @@ function WN($, Q, Z = true) {
     return null;
   return { tag: U, coordinate: W };
 }
-function HN($, Q, Z, K = true) {
+function WN($, Q, Z, K = true) {
   let q = K ? $.horizAxis : $.vertAxis;
   if (!q)
     return null;
@@ -39864,7 +39875,7 @@ function HN($, Q, Z, K = true) {
     return { minCoord: J.defaultMinMax.minCoord, maxCoord: J.defaultMinMax.maxCoord };
   return null;
 }
-var _N = { SmallMetrics: 1, SmallMetricsPng: 17, BigMetrics: 2, BigMetricsPng: 18, CompressedPng: 19 };
+var HN = { SmallMetrics: 1, SmallMetricsPng: 17, BigMetrics: 2, BigMetricsPng: 18, CompressedPng: 19 };
 function LJ($) {
   let Q = $.offset, Z = $.uint16(), K = $.uint16(), q = $.uint32(), J = [];
   for (let U = 0;U < q; U++) {
@@ -39876,7 +39887,7 @@ function LJ($) {
     for (let N = 0;N < W.numberOfIndexSubTables; N++)
       _.push({ firstGlyphIndex: H.uint16(), lastGlyphIndex: H.uint16(), additionalOffsetToIndexSubtable: H.uint32() });
     for (let N = 0;N < _.length; N++) {
-      let V = _[N], X = NN($, Q + W.indexSubTableArrayOffset + V.additionalOffsetToIndexSubtable, V.firstGlyphIndex, V.lastGlyphIndex);
+      let V = _[N], X = _N($, Q + W.indexSubTableArrayOffset + V.additionalOffsetToIndexSubtable, V.firstGlyphIndex, V.lastGlyphIndex);
       W.indexSubTables.push(X);
     }
   }
@@ -39885,7 +39896,7 @@ function LJ($) {
 function AJ($) {
   return { ascender: $.int8(), descender: $.int8(), widthMax: $.uint8(), caretSlopeNumerator: $.int8(), caretSlopeDenominator: $.int8(), caretOffset: $.int8(), minOriginSB: $.int8(), minAdvanceSB: $.int8(), maxBeforeBL: $.int8(), minAfterBL: $.int8(), pad1: $.int8(), pad2: $.int8() };
 }
-function NN($, Q, Z, K) {
+function _N($, Q, Z, K) {
   let q = $.sliceFrom(Q), J = q.uint16(), U = q.uint16(), W = q.uint32(), H = new Map, _ = K - Z + 1;
   switch (J) {
     case 1: {
@@ -39949,7 +39960,7 @@ function FJ($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.bytes($.remaining);
   return { majorVersion: Q, minorVersion: Z, data: K };
 }
-function VN($, Q, Z, K) {
+function NN($, Q, Z, K) {
   let q = null, J = 1 / 0;
   for (let U = 0;U < $.bitmapSizes.length; U++) {
     let W = $.bitmapSizes[U];
@@ -39966,11 +39977,11 @@ function VN($, Q, Z, K) {
     if (!H)
       continue;
     let _ = Q.data.slice(H.offset - 4, H.offset - 4 + H.length);
-    return XN(_, W.imageFormat);
+    return VN(_, W.imageFormat);
   }
   return null;
 }
-function XN($, Q) {
+function VN($, Q) {
   if ($.length === 0)
     return null;
   let Z = 0, K;
@@ -39999,7 +40010,7 @@ function XN($, Q) {
   }
   return { metrics: K, imageFormat: Q, data: $.slice(Z) };
 }
-function zN($, Q, Z) {
+function XN($, Q, Z) {
   for (let K = 0;K < $.bitmapSizes.length; K++) {
     let q = $.bitmapSizes[K];
     if (Z !== undefined && q.ppemX !== Z)
@@ -40012,7 +40023,7 @@ function zN($, Q, Z) {
   }
   return false;
 }
-function GN($) {
+function zN($) {
   let Q = new Set;
   for (let Z = 0;Z < $.bitmapSizes.length; Z++) {
     let K = $.bitmapSizes[Z];
@@ -40062,7 +40073,7 @@ function U1($) {
     if (E.fdSelect !== undefined) {
       $.seek(Q + E.fdSelect);
       let w = X[X.length - 1];
-      Y.push(EN($, w?.length ?? 0));
+      Y.push(jN($, w?.length ?? 0));
     } else
       Y.push({ format: 0, select: () => 0 });
   }
@@ -40074,7 +40085,7 @@ function T8($) {
     return [];
   let Z = $.uint8(), K = [];
   for (let J = 0;J <= Q; J++)
-    K.push(YN($, Z));
+    K.push(GN($, Z));
   let q = [];
   for (let J = 0;J < Q; J++) {
     let U = K[J], W = K[J + 1];
@@ -40085,7 +40096,7 @@ function T8($) {
   }
   return q;
 }
-function YN($, Q) {
+function GN($, Q) {
   switch (Q) {
     case 1:
       return $.uint8();
@@ -40113,7 +40124,7 @@ function RJ($) {
     else if (K === 29)
       Z.push($.int32());
     else if (K === 30)
-      Z.push(jN($));
+      Z.push(YN($));
     else if (K >= 32 && K <= 246)
       Z.push(K - 139);
     else if (K >= 247 && K <= 250) {
@@ -40126,7 +40137,7 @@ function RJ($) {
   }
   return Q;
 }
-function jN($) {
+function YN($) {
   let Q = "", Z = "0123456789.EE -", K = false;
   while (!K) {
     let q = $.uint8();
@@ -40338,7 +40349,7 @@ function z9($) {
   }
   return Q;
 }
-function EN($, Q) {
+function jN($, Q) {
   let Z = $.uint8();
   if (Z === 0) {
     let K = $.uint8Array(Q);
@@ -40362,7 +40373,7 @@ function EN($, Q) {
   }
   return { format: Z, select: () => 0 };
 }
-function wN($, Q) {
+function EN($, Q) {
   if (Q < G9.length)
     return G9[Q] ?? "";
   return $.strings[Q - G9.length] ?? "";
@@ -41170,7 +41181,7 @@ function MJ($, Q, Z, K) {
           let G = H[N * U + z];
           if (G === undefined)
             continue;
-          let Y = AN($.vstore, $.vsindex, z, $.axisCoords);
+          let Y = wN($.vstore, $.vsindex, z, $.axisCoords);
           X += G * Y;
         }
         q.push(X);
@@ -41199,7 +41210,7 @@ function TJ($) {
     return 1131;
   return 32768;
 }
-function AN($, Q, Z, K) {
+function wN($, Q, Z, K) {
   let q = $.itemVariationData[Q];
   if (!q)
     return 0;
@@ -41228,7 +41239,7 @@ function AN($, Q, Z, K) {
   }
   return W;
 }
-function LN($, Q, Z = 0) {
+function AN($, Q, Z = 0) {
   let K = $.topDicts[Z];
   return 0;
 }
@@ -41237,7 +41248,7 @@ function H1($) {
   $.seek(Q + q);
   let U = $.slice($.offset - Q, J);
   $.skip(J);
-  let W = BN(U), H = U5($), _ = [];
+  let W = DN(U), H = U5($), _ = [];
   if (W.charStrings !== undefined)
     $.seek(Q + W.charStrings), _ = U5($);
   let N = [];
@@ -41245,11 +41256,11 @@ function H1($) {
     $.seek(Q + W.fdArray);
     let z = U5($);
     for (let G = 0;G < z.length; G++) {
-      let Y = z[G], j = RN(new D6(Y.buffer, Y.byteOffset, Y.byteLength));
+      let Y = z[G], j = BN(new D6(Y.buffer, Y.byteOffset, Y.byteLength));
       if (j.privateOffset !== undefined && j.privateSize !== undefined) {
         $.seek(Q + j.privateOffset);
         let E = $.slice(0, j.privateSize);
-        if (j.private = MN(E), j.private.subrs !== undefined)
+        if (j.private = RN(E), j.private.subrs !== undefined)
           $.seek(Q + j.privateOffset + j.private.subrs), j.localSubrs = U5($);
       }
       N.push(j);
@@ -41257,10 +41268,10 @@ function H1($) {
   }
   let V = null;
   if (W.fdSelect !== undefined)
-    $.seek(Q + W.fdSelect), V = TN($, _.length);
+    $.seek(Q + W.fdSelect), V = MN($, _.length);
   let X = null;
   if (W.vstore !== undefined)
-    $.seek(Q + W.vstore), X = ON($);
+    $.seek(Q + W.vstore), X = TN($);
   return { version: { major: Z, minor: K }, topDict: W, globalSubrs: H, charStrings: _, fdArray: N, fdSelect: V, vstore: X };
 }
 function U5($) {
@@ -41269,7 +41280,7 @@ function U5($) {
     return [];
   let Z = $.uint8(), K = [];
   for (let J = 0;J <= Q; J++)
-    K.push(FN($, Z));
+    K.push(LN($, Z));
   let q = [];
   for (let J = 0;J < Q; J++) {
     let U = K[J], W = K[J + 1];
@@ -41280,7 +41291,7 @@ function U5($) {
   }
   return q;
 }
-function FN($, Q) {
+function LN($, Q) {
   switch (Q) {
     case 1:
       return $.uint8();
@@ -41314,7 +41325,7 @@ function _1($) {
     else if (K === 29)
       Z.push($.int32());
     else if (K === 30)
-      Z.push(DN($));
+      Z.push(FN($));
     else if (K >= 32 && K <= 246)
       Z.push(K - 139);
     else if (K >= 247 && K <= 250) {
@@ -41327,7 +41338,7 @@ function _1($) {
   }
   return Q;
 }
-function DN($) {
+function FN($) {
   let Q = "", Z = "0123456789.EE -", K = false;
   while (!K) {
     let q = $.uint8();
@@ -41348,7 +41359,7 @@ function DN($) {
   }
   return parseFloat(Q);
 }
-function BN($) {
+function DN($) {
   let Q = _1($), Z = {}, K = [...Q];
   for (let q = 0;q < K.length; q++) {
     let [J, U] = K[q];
@@ -41372,13 +41383,13 @@ function BN($) {
   }
   return Z;
 }
-function RN($) {
+function BN($) {
   let Q = _1($), Z = {}, K = Q.get(18);
   if (K && K.length >= 2)
     Z.privateSize = K[0], Z.privateOffset = K[1];
   return Z;
 }
-function MN($) {
+function RN($) {
   let Q = _1($), Z = {}, K = [...Q];
   for (let q = 0;q < K.length; q++) {
     let [J, U] = K[q], W = U[0];
@@ -41443,7 +41454,7 @@ function j9($) {
   }
   return Q;
 }
-function TN($, Q) {
+function MN($, Q) {
   let Z = $.uint8();
   if (Z === 0) {
     let K = $.uint8Array(Q);
@@ -41481,19 +41492,19 @@ function TN($, Q) {
   }
   return { format: Z, select: () => 0 };
 }
-function ON($) {
+function TN($) {
   let Q = $.offset, Z = $.uint16(), K = $.uint16(), q = $.uint32(), J = $.uint16(), U = [];
   for (let _ = 0;_ < J; _++)
     U.push($.uint32());
   $.seek(Q + q);
-  let W = PN($), H = [];
+  let W = ON($), H = [];
   for (let _ = 0;_ < U.length; _++) {
     let N = U[_];
-    $.seek(Q + N), H.push(IN($));
+    $.seek(Q + N), H.push(PN($));
   }
   return { format: K, variationRegionList: W, itemVariationData: H };
 }
-function PN($) {
+function ON($) {
   let Q = $.uint16(), Z = $.uint16(), K = [];
   for (let q = 0;q < Z; q++) {
     let J = [];
@@ -41503,7 +41514,7 @@ function PN($) {
   }
   return { axisCount: Q, regionCount: Z, regions: K };
 }
-function IN($) {
+function PN($) {
   let Q = $.uint16(), Z = $.uint16(), K = Z & 32767, q = (Z & 32768) !== 0, J = [];
   for (let W = 0;W < K; W++)
     J.push($.uint16());
@@ -41519,7 +41530,7 @@ function IN($) {
   }
   return { itemCount: Q, regionIndexCount: K, regionIndexes: J, deltaSets: U };
 }
-function vN($, Q, Z, K) {
+function IN($, Q, Z, K) {
   let q = $.itemVariationData[Q];
   if (!q)
     return 0;
@@ -41573,7 +41584,7 @@ function OJ($, Q) {
       continue;
     }
     W.add(V.offset);
-    let X = $.slice(V.offset, Q - V.offset), z = kN(X);
+    let X = $.slice(V.offset, Q - V.offset), z = vN(X);
     if (z) {
       let G = `${V.platformId}-${V.encodingId}`;
       U.set(G, z);
@@ -41599,21 +41610,21 @@ function OJ($, Q) {
   }
   return { version: K, numTables: q, encodingRecords: J, subtables: U, bestSubtable: _ };
 }
-function kN($) {
+function vN($) {
   switch ($.uint16()) {
     case 0:
-      return CN($);
+      return kN($);
     case 4:
-      return SN($);
+      return CN($);
     case 12:
-      return hN($);
+      return SN($);
     case 14:
-      return yN($);
+      return hN($);
     default:
       return null;
   }
 }
-function CN($) {
+function kN($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint8Array(256);
   return { format: 0, glyphIdArray: K, lookup(q) {
     if (q >= 0 && q < 256)
@@ -41621,7 +41632,7 @@ function CN($) {
     return;
   } };
 }
-function SN($) {
+function CN($) {
   let Q = $.uint16(), Z = $.uint16(), q = $.uint16() / 2;
   $.skip(6);
   let J = $.uint16Array(q);
@@ -41663,7 +41674,7 @@ function SN($) {
     return z(Y);
   } };
 }
-function hN($) {
+function SN($) {
   $.skip(2);
   let Q = $.uint32(), Z = $.uint32(), K = $.uint32(), q = Array(K);
   for (let W = 0;W < K; W++)
@@ -41695,7 +41706,7 @@ function hN($) {
     return J(W);
   } };
 }
-function yN($) {
+function hN($) {
   let Q = $.offset - 2, Z = $.uint32(), K = $.uint32(), q = [];
   for (let U = 0;U < K; U++)
     q.push({ varSelector: $.uint24(), defaultUVSOffset: $.uint32(), nonDefaultUVSOffset: $.uint32() });
@@ -41874,11 +41885,11 @@ function V1($) {
       }
     }
     if (X !== 0)
-      $.seek(Q + X), _.clipList = bN($, Q);
+      $.seek(Q + X), _.clipList = yN($, Q);
     if (z !== 0)
-      $.seek(Q + z), _.varIdxMap = gN($);
+      $.seek(Q + z), _.varIdxMap = mN($);
     if (G !== 0)
-      $.seek(Q + G), _.itemVariationStore = uN($);
+      $.seek(Q + G), _.itemVariationStore = gN($);
   }
   return _;
 }
@@ -42010,7 +42021,7 @@ function N1($) {
     K.push({ stopOffset: $.f2dot14(), paletteIndex: $.uint16(), alpha: $.f2dot14() });
   return { extend: Q, colorStops: K };
 }
-function bN($, Q) {
+function yN($, Q) {
   let Z = $.offset, K = $.uint8(), q = $.uint32(), J = [];
   for (let U = 0;U < q; U++) {
     let W = $.uint16(), H = $.uint16(), _ = $.uint24(), N = $.offset;
@@ -42060,10 +42071,10 @@ function SJ($, Q) {
   }
   return null;
 }
-function mN($, Q) {
+function bN($, Q) {
   return CJ($, Q) !== null || SJ($, Q) !== null;
 }
-function gN($) {
+function mN($) {
   let Q = $.uint8(), Z = $.uint8(), K = Q === 0 ? $.uint16() : $.uint32(), q = (Z & 15) + 1, J = (Z >> 4 & 15) + 1, U = Math.ceil((q + J) / 8), W = [];
   for (let H = 0;H < K; H++) {
     let _ = 0;
@@ -42074,7 +42085,7 @@ function gN($) {
   }
   return W;
 }
-function uN($) {
+function gN($) {
   let Q = $.offset, Z = $.uint16(), K = $.uint32(), q = $.uint16(), J = [];
   for (let N = 0;N < q; N++)
     J.push($.uint32());
@@ -42107,7 +42118,7 @@ function uN($) {
   }
   return { format: Z, variationRegionListOffset: K, itemVariationDataCount: q, itemVariationDataOffsets: J, variationRegions: H, itemVariationData: _ };
 }
-function xN($, Q) {
+function uN($, Q) {
   if (!$.clipList)
     return null;
   for (let Z = 0;Z < $.clipList.length; Z++) {
@@ -42117,7 +42128,7 @@ function xN($, Q) {
   }
   return null;
 }
-function fN($, Q, Z) {
+function xN($, Q, Z) {
   if (!$.itemVariationStore || !$.varIdxMap)
     return 0;
   let K = $.varIdxMap[Q];
@@ -42142,7 +42153,7 @@ function fN($, Q, Z) {
       let j = X.regionAxes[Y], E = Z[Y];
       if (j === undefined || E === undefined)
         continue;
-      if (z *= lN(E, j.startCoord, j.peakCoord, j.endCoord), z === 0)
+      if (z *= fN(E, j.startCoord, j.peakCoord, j.endCoord), z === 0)
         break;
     }
     let G = H[N];
@@ -42151,7 +42162,7 @@ function fN($, Q, Z) {
   }
   return _;
 }
-function lN($, Q, Z, K) {
+function fN($, Q, Z, K) {
   if (Q === 0 && Z === 0 && K === 0)
     return 1;
   if ($ === Z)
@@ -42168,10 +42179,10 @@ function lN($, Q, Z, K) {
     return (K - $) / (K - Z);
   }
 }
-function dN($) {
+function lN($) {
   return $.version >= 1 && $.baseGlyphPaintRecords !== undefined;
 }
-function nN($, Q) {
+function dN($, Q) {
   return $.layerList?.[Q] ?? null;
 }
 var hJ;
@@ -42222,16 +42233,16 @@ function X1($) {
   }
   return { version: Z, numPalettes: q, numPaletteEntries: K, palettes: _, paletteTypes: N, paletteLabels: V, paletteEntryLabels: X };
 }
-function pN($, Q, Z) {
+function nN($, Q, Z) {
   let K = $.palettes[Q];
   if (!K)
     return null;
   return K.colors[Z] ?? null;
 }
-function cN($) {
+function pN($) {
   return `rgba(${$.red}, ${$.green}, ${$.blue}, ${($.alpha / 255).toFixed(3)})`;
 }
-function oN($) {
+function cN($) {
   let Q = $.red.toString(16).padStart(2, "0"), Z = $.green.toString(16).padStart(2, "0"), K = $.blue.toString(16).padStart(2, "0");
   if ($.alpha === 255)
     return `#${Q}${Z}${K}`;
@@ -42457,25 +42468,25 @@ function z1($) {
   }
   return { version: Z, features: q };
 }
-function iN($, Q) {
+function oN($, Q) {
   return $.features.find((Z) => Z.featureType === Q);
 }
-function sN($) {
+function iN($) {
   return $.features;
 }
-function rN($) {
+function sN($) {
   return ($.featureFlags & 32768) !== 0;
 }
-function aN($) {
+function rN($) {
   return $.settings[$.defaultSettingIndex];
 }
-function tN($, Q) {
+function aN($, Q) {
   return $.settings.find((Z) => Z.settingValue === Q);
 }
-function eN($, Q) {
+function tN($, Q) {
   return $.settings.some((Z) => Z.settingValue === Q);
 }
-function $V($, Q) {
+function eN($, Q) {
   switch ($) {
     case 1:
       switch (Q) {
@@ -42593,7 +42604,7 @@ function $V($, Q) {
   }
   return null;
 }
-function QV($) {
+function $V($) {
   switch ($) {
     case "liga":
       return { featureType: 1, settingValue: 2 };
@@ -42688,10 +42699,10 @@ function Y1($, Q) {
     return $.ranges[$.ranges.length - 1]?.behavior;
   return K0.GridFit | K0.DoGray;
 }
-function ZV($, Q) {
+function QV($, Q) {
   return (Y1($, Q) & K0.GridFit) !== 0;
 }
-function KV($, Q) {
+function ZV($, Q) {
   return (Y1($, Q) & K0.DoGray) !== 0;
 }
 
@@ -42794,16 +42805,16 @@ function tJ($) {
     W = $.offset16();
   let H = R6($, K), _ = null;
   if (q !== 0)
-    _ = qV($.sliceFrom(q));
+    _ = KV($.sliceFrom(q));
   let N = null;
   if (J !== 0)
-    N = JV($.sliceFrom(J));
+    N = qV($.sliceFrom(J));
   let V = R6($, U), X = null;
   if (W !== 0)
-    X = UV($.sliceFrom(W));
+    X = JV($.sliceFrom(W));
   return { version: { major: Q, minor: Z }, glyphClassDef: H, attachList: _, ligCaretList: N, markAttachClassDef: V, markGlyphSets: X };
 }
-function qV($) {
+function KV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = $.sliceFrom(Q), J = q.uint16(), U = [];
   if (J === 1) {
     let H = q.uint16();
@@ -42830,7 +42841,7 @@ function qV($) {
   }
   return W;
 }
-function JV($) {
+function qV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = $.sliceFrom(Q), J = q.uint16(), U = [];
   if (J === 1) {
     let H = q.uint16();
@@ -42864,7 +42875,7 @@ function JV($) {
   }
   return W;
 }
-function UV($) {
+function JV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint32Array(Z), q = [];
   for (let J = 0;J < K.length; J++) {
     let U = K[J], W = $.sliceFrom(U), H = W.uint16(), _ = new Set;
@@ -42974,9 +42985,9 @@ function $U($) {
 function c8($, Q) {
   if (Q === 0)
     return null;
-  return WV($.sliceFrom(Q));
+  return UV($.sliceFrom(Q));
 }
-function WV($) {
+function UV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16();
   if (K === 32768)
     return { deltaSetOuterIndex: Q, deltaSetInnerIndex: Z };
@@ -43001,7 +43012,7 @@ function QU($, Q) {
   let Z = Q - $.startSize;
   return $.deltaValues[Z] ?? 0;
 }
-function HV($, Q, Z) {
+function WV($, Q, Z) {
   if (!$)
     return Q;
   if ($U($))
@@ -43018,12 +43029,12 @@ function q0($) {
     Z.push({ tag: $.tag(), offset: $.offset16() });
   let K = [];
   for (let q = 0;q < Z.length; q++) {
-    let J = Z[q], U = $.sliceFrom(J.offset), W = _V(U);
+    let J = Z[q], U = $.sliceFrom(J.offset), W = HV(U);
     K.push({ scriptTag: J.tag, script: W });
   }
   return { scripts: K };
 }
-function _V($) {
+function HV($) {
   let Q = $.offset16(), Z = $.uint16(), K = [];
   for (let U = 0;U < Z; U++)
     K.push({ tag: $.tag(), offset: $.offset16() });
@@ -43049,26 +43060,26 @@ function J0($) {
     Z.push({ tag: $.tag(), offset: $.offset16() });
   let K = [];
   for (let q = 0;q < Z.length; q++) {
-    let J = Z[q], U = $.sliceFrom(J.offset), W = NV(U);
+    let J = Z[q], U = $.sliceFrom(J.offset), W = _V(U);
     K.push({ featureTag: J.tag, feature: W });
   }
   return { features: K };
 }
-function NV($) {
+function _V($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = Array(Z);
   for (let J = 0;J < Z; J++)
     q[J] = K[J];
   return { featureParamsOffset: Q, lookupListIndices: q };
 }
-function VV($) {
+function NV($) {
   let Q = $.uint16(), Z = $.uint16Array(Q), K = [];
   for (let q = 0;q < Z.length; q++) {
     let J = Z[q], U = $.sliceFrom(J);
-    K.push(XV(U));
+    K.push(VV(U));
   }
   return K;
 }
-function XV($) {
+function VV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16Array(K), J = Array(K);
   for (let W = 0;W < K; W++)
     J[W] = q[W];
@@ -43130,7 +43141,7 @@ class V6 {
     return { mask0: this.mask0, mask1: this.mask1, mask2: this.mask2 };
   }
 }
-function zV($) {
+function XV($) {
   let Q = new V6;
   for (let Z = 0;Z < $.length; Z++) {
     let K = $[Z];
@@ -43144,19 +43155,19 @@ function E1($, Q) {
     let q = Q[K], J = $.sliceFrom(q);
     switch (J.uint16()) {
       case 1:
-        Z.push(GV(J));
+        Z.push(zV(J));
         break;
       case 2:
-        Z.push(YV(J));
+        Z.push(GV(J));
         break;
       case 3:
-        Z.push(jV(J));
+        Z.push(YV(J));
         break;
     }
   }
   return Z;
 }
-function GV($) {
+function zV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = s($, Q), J = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43176,7 +43187,7 @@ function GV($) {
   }
   return { format: 1, coverage: q, ruleSets: J };
 }
-function YV($) {
+function GV($) {
   let Q = $.offset16(), Z = $.offset16(), K = $.uint16(), q = $.uint16Array(K), J = s($, Q), U = R6($, Z), W = [];
   for (let H = 0;H < q.length; H++) {
     let _ = q[H];
@@ -43196,7 +43207,7 @@ function YV($) {
   }
   return { format: 2, coverage: J, classDef: U, classRuleSets: W };
 }
-function jV($) {
+function YV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16Array(Q), q = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43211,19 +43222,19 @@ function w1($, Q) {
     let q = Q[K], J = $.sliceFrom(q);
     switch (J.uint16()) {
       case 1:
-        Z.push(EV(J));
+        Z.push(jV(J));
         break;
       case 2:
-        Z.push(wV(J));
+        Z.push(EV(J));
         break;
       case 3:
-        Z.push(AV(J));
+        Z.push(wV(J));
         break;
     }
   }
   return Z;
 }
-function EV($) {
+function jV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = s($, Q), J = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43249,7 +43260,7 @@ function EV($) {
   }
   return { format: 1, coverage: q, chainRuleSets: J };
 }
-function wV($) {
+function EV($) {
   let Q = $.offset16(), Z = $.offset16(), K = $.offset16(), q = $.offset16(), J = $.uint16(), U = $.uint16Array(J), W = s($, Q), H = R6($, Z), _ = R6($, K), N = R6($, q), V = [];
   for (let X = 0;X < U.length; X++) {
     let z = U[X];
@@ -43275,7 +43286,7 @@ function wV($) {
   }
   return { format: 2, coverage: W, backtrackClassDef: H, inputClassDef: _, lookaheadClassDef: N, chainClassRuleSets: V };
 }
-function AV($) {
+function wV($) {
   let Q = $.uint16(), Z = $.uint16Array(Q), K = $.uint16(), q = $.uint16Array(K), J = $.uint16(), U = $.uint16Array(J), W = $.uint16(), H = w9($, W), _ = [];
   for (let X = 0;X < Z.length; X++) {
     let z = Z[X];
@@ -43426,13 +43437,13 @@ function qU($) {
     $.offset32();
   let U = q0($.sliceFrom(K)), W = J0($.sliceFrom(q)), H = $.sliceFrom(J), _ = H.uint16(), N = H.uint16Array(_), V = [];
   for (let X = 0;X < N.length; X++) {
-    let z = N[X], G = H.sliceFrom(z), Y = LV(G);
+    let z = N[X], G = H.sliceFrom(z), Y = AV(G);
     if (Y)
       V.push(Y);
   }
   return { version: { major: Q, minor: Z }, scriptList: U, featureList: W, lookups: V };
 }
-function LV($) {
+function AV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16Array(K), J = Array(q.length);
   for (let N = 0;N < q.length; N++)
     J[N] = q[N];
@@ -43504,7 +43515,7 @@ function LV($) {
       return { type: 8, ...W, subtables: N, digest: V };
     }
     case 9:
-      return BV($, J, W);
+      return DV($, J, W);
     default:
       return null;
   }
@@ -43564,13 +43575,13 @@ function UU($, Q) {
   for (let K = 0;K < Q.length; K++) {
     let q = Q[K], J = $.sliceFrom(q), U = $.sliceFrom(q), W = U.uint16();
     if (W === 1)
-      Z.push(FV(U, J));
+      Z.push(LV(U, J));
     else if (W === 2)
-      Z.push(DV(U, J));
+      Z.push(FV(U, J));
   }
   return Z;
 }
-function FV($, Q) {
+function LV($, Q) {
   let Z = $.offset16(), K = $.uint16(), q = $.uint16(), J = $.uint16(), U = $.uint16Array(J), W = s(Q, Z), H = [];
   for (let _ = 0;_ < U.length; _++) {
     let N = U[_], V = Q.sliceFrom(N), X = Q.sliceFrom(N), z = X.uint16(), G = [];
@@ -43582,7 +43593,7 @@ function FV($, Q) {
   }
   return { format: 1, coverage: W, valueFormat1: K, valueFormat2: q, pairSets: H };
 }
-function DV($, Q) {
+function FV($, Q) {
   let Z = $.offset16(), K = $.uint16(), q = $.uint16(), J = $.offset16(), U = $.offset16(), W = $.uint16(), H = $.uint16(), _ = s(Q, Z), N = R6(Q, J), V = R6(Q, U), X = [];
   for (let z = 0;z < W; z++) {
     let G = [];
@@ -43594,7 +43605,7 @@ function DV($, Q) {
   }
   return { format: 2, coverage: _, valueFormat1: K, valueFormat2: q, classDef1: N, classDef2: V, class1Count: W, class2Count: H, class1Records: X };
 }
-function BV($, Q, Z) {
+function DV($, Q, Z) {
   if (Q.length === 0)
     return null;
   let K = [];
@@ -43710,7 +43721,7 @@ function BV($, Q, Z) {
       return null;
   }
 }
-function RV($, Q) {
+function BV($, Q) {
   let Z = 0, K = $.length - 1;
   while (Z <= K) {
     let q = Z + K >>> 1, J = $[q], U = J.secondGlyph;
@@ -43732,7 +43743,7 @@ function R1($, Q, Z, K, q) {
       let H = U.pairSets[W];
       if (!H)
         continue;
-      let _ = RV(H.pairValueRecords, Z);
+      let _ = BV(H.pairValueRecords, Z);
       if (_) {
         let N = _.value1.xAdvance, V = _.value2.xAdvance;
         if (N)
@@ -43764,19 +43775,19 @@ function M1($, Q) {
     let q = Q[K], J = $.sliceFrom(q);
     switch (J.uint16()) {
       case 1:
-        Z.push(MV(J));
+        Z.push(RV(J));
         break;
       case 2:
-        Z.push(TV(J));
+        Z.push(MV(J));
         break;
       case 3:
-        Z.push(OV(J));
+        Z.push(TV(J));
         break;
     }
   }
   return Z;
 }
-function MV($) {
+function RV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = s($, Q), J = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43796,7 +43807,7 @@ function MV($) {
   }
   return { format: 1, coverage: q, ruleSets: J };
 }
-function TV($) {
+function MV($) {
   let Q = $.offset16(), Z = $.offset16(), K = $.uint16(), q = $.uint16Array(K), J = s($, Q), U = R6($, Z), W = [];
   for (let H = 0;H < q.length; H++) {
     let _ = q[H];
@@ -43816,7 +43827,7 @@ function TV($) {
   }
   return { format: 2, coverage: J, classDef: U, classRuleSets: W };
 }
-function OV($) {
+function TV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16Array(Q), q = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43831,19 +43842,19 @@ function T1($, Q) {
     let q = Q[K], J = $.sliceFrom(q);
     switch (J.uint16()) {
       case 1:
-        Z.push(PV(J));
+        Z.push(OV(J));
         break;
       case 2:
-        Z.push(IV(J));
+        Z.push(PV(J));
         break;
       case 3:
-        Z.push(vV(J));
+        Z.push(IV(J));
         break;
     }
   }
   return Z;
 }
-function PV($) {
+function OV($) {
   let Q = $.offset16(), Z = $.uint16(), K = $.uint16Array(Z), q = s($, Q), J = [];
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -43869,7 +43880,7 @@ function PV($) {
   }
   return { format: 1, coverage: q, chainRuleSets: J };
 }
-function IV($) {
+function PV($) {
   let Q = $.offset16(), Z = $.offset16(), K = $.offset16(), q = $.offset16(), J = $.uint16(), U = $.uint16Array(J), W = s($, Q), H = R6($, Z), _ = R6($, K), N = R6($, q), V = [];
   for (let X = 0;X < U.length; X++) {
     let z = U[X];
@@ -43895,7 +43906,7 @@ function IV($) {
   }
   return { format: 2, coverage: W, backtrackClassDef: H, inputClassDef: _, lookaheadClassDef: N, chainClassRuleSets: V };
 }
-function vV($) {
+function IV($) {
   let Q = $.uint16(), Z = $.uint16Array(Q), K = $.uint16(), q = $.uint16Array(K), J = $.uint16(), U = $.uint16Array(J), W = $.uint16(), H = L9($, W), _ = [];
   for (let X = 0;X < Z.length; X++) {
     let z = Z[X];
@@ -43925,13 +43936,13 @@ function WU($) {
     $.offset32();
   let U = q0($.sliceFrom(K)), W = J0($.sliceFrom(q)), H = $.sliceFrom(J), _ = H.uint16(), N = H.uint16Array(_), V = [];
   for (let X = 0;X < N.length; X++) {
-    let z = N[X], G = H.sliceFrom(z), Y = kV(G, H, z);
+    let z = N[X], G = H.sliceFrom(z), Y = vV(G, H, z);
     if (Y)
       V.push(Y);
   }
   return { version: { major: Q, minor: Z }, scriptList: U, featureList: W, lookups: V };
 }
-function kV($, Q, Z) {
+function vV($, Q, Z) {
   let K = $.uint16(), q = $.uint16(), J = $.uint16(), U = $.uint16Array(J), W = Array(U.length);
   for (let V = 0;V < U.length; V++)
     W[V] = U[V];
@@ -43984,7 +43995,7 @@ function kV($, Q, Z) {
       return { type: 6, ..._, subtables: V, digest: X };
     }
     case 7:
-      return CV($, W, _);
+      return kV($, W, _);
     case 8: {
       let V = XU($, W);
       return { type: 8, ..._, subtables: V, digest: N(V) };
@@ -44088,7 +44099,7 @@ function XU($, Q) {
   }
   return Z;
 }
-function CV($, Q, Z) {
+function kV($, Q, Z) {
   if (Q.length === 0)
     return null;
   let K = [];
@@ -44265,7 +44276,7 @@ function wU($, Q) {
   let Z = Q - $.hMetrics.length;
   return $.leftSideBearings[Z] ?? 0;
 }
-var SV = { ShrinkGpos: 0, DisableGpos: 1, ShrinkGsub: 2, DisableGsub: 3, EnableGpos: 4, EnableGsub: 5, MaxExtendGpos: 6, MaxExtendGsub: 7 };
+var CV = { ShrinkGpos: 0, DisableGpos: 1, ShrinkGsub: 2, DisableGsub: 3, EnableGpos: 4, EnableGsub: 5, MaxExtendGpos: 6, MaxExtendGsub: 7 };
 function I8($, Q) {
   if (Q === 0)
     return null;
@@ -44282,7 +44293,7 @@ function AU($, Q) {
     q.push(Z.uint16());
   return { lookupIndices: q };
 }
-function hV($, Q) {
+function SV($, Q) {
   let Z = $.sliceFrom(Q), K = Z.uint16(), q = Z.uint16(), J = Z.uint16(), U = Z.uint16(), W = Z.uint16(), H = Z.uint16(), _ = Z.uint16(), N = Z.uint16(), V = Z.uint16(), X = Z.uint16();
   return { shrinkageEnableGsub: I8($, Q + K), shrinkageDisableGsub: I8($, Q + q), shrinkageEnableGpos: I8($, Q + J), shrinkageDisableGpos: I8($, Q + U), shrinkageJstfMax: AU($, Q + W), extensionEnableGsub: I8($, Q + H), extensionDisableGsub: I8($, Q + _), extensionEnableGpos: I8($, Q + N), extensionDisableGpos: I8($, Q + V), extensionJstfMax: AU($, Q + X) };
 }
@@ -44293,11 +44304,11 @@ function LU($, Q) {
   let J = [];
   for (let U = 0;U < q.length; U++) {
     let W = q[U];
-    J.push(hV($, Q + W));
+    J.push(SV($, Q + W));
   }
   return { priorities: J };
 }
-function yV($, Q) {
+function hV($, Q) {
   let Z = $.sliceFrom(Q), K = Z.uint16(), q = Z.uint16(), J = Z.uint16(), U = [];
   for (let N = 0;N < J; N++) {
     let V = Z.uint32(), X = Z.uint16();
@@ -44324,7 +44335,7 @@ function v1($) {
   }
   let J = [];
   for (let U = 0;U < q.length; U++) {
-    let { tag: W, offset: H } = q[U], _ = yV($, H);
+    let { tag: W, offset: H } = q[U], _ = hV($, H);
     J.push({ scriptTag: W, ..._ });
   }
   return { majorVersion: Q, minorVersion: Z, scripts: J };
@@ -44354,7 +44365,7 @@ function FU($) {
   if (Q === 0) {
     let K = $.uint16();
     for (let q = 0;q < K; q++) {
-      let J = bV($);
+      let J = yV($);
       if (J)
         Z.push(J);
     }
@@ -44362,14 +44373,14 @@ function FU($) {
     $.skip(2);
     let K = $.uint32();
     for (let q = 0;q < K; q++) {
-      let J = mV($);
+      let J = bV($);
       if (J)
         Z.push(J);
     }
   }
   return { version: Q, subtables: Z };
 }
-function bV($) {
+function yV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = { horizontal: (K & 1) !== 0, minimum: (K & 2) !== 0, crossStream: (K & 4) !== 0, override: (K & 8) !== 0 }, J = K >> 8 & 255;
   if (J === 0)
     return DU($, q);
@@ -44377,7 +44388,7 @@ function bV($) {
     return BU($, q, Z - 6);
   return $.skip(Z - 6), null;
 }
-function mV($) {
+function bV($) {
   let Q = $.uint32(), Z = $.uint16(), K = $.uint16(), q = { horizontal: (Z & 32768) === 0, minimum: false, crossStream: (Z & 16384) !== 0, override: (Z & 8192) !== 0 }, J = Z & 255;
   if (J === 0)
     return DU($, q);
@@ -44457,33 +44468,33 @@ function MU($) {
   $.skip(2);
   let Z = $.uint32(), K = [];
   for (let q = 0;q < Z; q++) {
-    let J = gV($);
+    let J = mV($);
     if (J)
       K.push(J);
   }
   return { version: Q, nTables: Z, subtables: K };
 }
-function gV($) {
+function mV($) {
   let Q = $.uint32(), Z = $.uint32(), K = $.uint16();
   $.skip(2);
   let q = Z & 255, J = { vertical: (Z & 2147483648) !== 0, crossStream: (Z & 1073741824) !== 0, variation: (Z & 536870912) !== 0 }, U = { length: Q, coverage: J, tupleCount: K }, W = $.offset + Q - 12, H = null;
   switch (q) {
     case 0:
-      H = uV($, U);
+      H = gV($, U);
       break;
     case 1:
-      H = xV($, U);
+      H = uV($, U);
       break;
     case 2:
-      H = fV($, U);
+      H = xV($, U);
       break;
     case 6:
-      H = lV($, U);
+      H = fV($, U);
       break;
   }
   return $.seek(W), H;
 }
-function uV($, Q) {
+function gV($, Q) {
   let Z = $.uint32();
   $.skip(12);
   let K = [];
@@ -44491,11 +44502,11 @@ function uV($, Q) {
     K.push({ left: $.uint16(), right: $.uint16(), value: $.int16() }), $.skip(2);
   return { ...Q, format: 0, nPairs: Z, pairs: K };
 }
-function xV($, Q) {
+function uV($, Q) {
   let Z = { nClasses: $.uint32(), classTableOffset: $.offset32(), stateArrayOffset: $.offset32(), entryTableOffset: $.offset32(), valueTableOffset: $.offset32() };
   return { ...Q, format: 1, stateHeader: Z };
 }
-function fV($, Q) {
+function xV($, Q) {
   let Z = $.uint16();
   $.skip(2);
   let K = $.offset32(), q = $.offset32(), J = $.offset32(), U = RU($.sliceFrom(K)), W = RU($.sliceFrom(q)), H = $.sliceFrom(J), _ = U.nGlyphs > 0 ? Math.max(...[...U.classes]) + 1 : 0, N = Z / 2, V = new Int16Array(_ * N);
@@ -44509,11 +44520,11 @@ function RU($) {
     K[q] = $.uint8();
   return { firstGlyph: Q, nGlyphs: Z, classes: K };
 }
-function lV($, Q) {
+function fV($, Q) {
   let Z = $.uint32(), K = $.uint16(), q = $.uint16(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = $.offset32();
   return { ...Q, format: 6, flags: Z, rowCount: K, columnCount: q, rowIndexTableOffset: J, columnIndexTableOffset: U, kerningArrayOffset: W, kerningVectorOffset: H };
 }
-function dV($, Q, Z) {
+function lV($, Q, Z) {
   for (let K = 0;K < $.subtables.length; K++) {
     let q = $.subtables[K];
     if (q.coverage.vertical)
@@ -44556,59 +44567,59 @@ function dV($, Q, Z) {
   }
   return 0;
 }
-function o($, Q) {
+function c($, Q) {
   let Z = $.int16(), K = $.uint16();
   return { value: Z, device: c8(Q, K) };
 }
-function nV($) {
+function dV($) {
   let Q = $, Z = $.int16(), K = $.int16(), q = $.uint16(), J = $.uint16();
-  return { scriptPercentScaleDown: Z, scriptScriptPercentScaleDown: K, delimitedSubFormulaMinHeight: q, displayOperatorMinHeight: J, mathLeading: o($, Q), axisHeight: o($, Q), accentBaseHeight: o($, Q), flattenedAccentBaseHeight: o($, Q), subscriptShiftDown: o($, Q), subscriptTopMax: o($, Q), subscriptBaselineDropMin: o($, Q), superscriptShiftUp: o($, Q), superscriptShiftUpCramped: o($, Q), superscriptBottomMin: o($, Q), superscriptBaselineDropMax: o($, Q), subSuperscriptGapMin: o($, Q), superscriptBottomMaxWithSubscript: o($, Q), spaceAfterScript: o($, Q), upperLimitGapMin: o($, Q), upperLimitBaselineRiseMin: o($, Q), lowerLimitGapMin: o($, Q), lowerLimitBaselineDropMin: o($, Q), stackTopShiftUp: o($, Q), stackTopDisplayStyleShiftUp: o($, Q), stackBottomShiftDown: o($, Q), stackBottomDisplayStyleShiftDown: o($, Q), stackGapMin: o($, Q), stackDisplayStyleGapMin: o($, Q), stretchStackTopShiftUp: o($, Q), stretchStackBottomShiftDown: o($, Q), stretchStackGapAboveMin: o($, Q), stretchStackGapBelowMin: o($, Q), fractionNumeratorShiftUp: o($, Q), fractionNumeratorDisplayStyleShiftUp: o($, Q), fractionDenominatorShiftDown: o($, Q), fractionDenominatorDisplayStyleShiftDown: o($, Q), fractionNumeratorGapMin: o($, Q), fractionNumDisplayStyleGapMin: o($, Q), fractionRuleThickness: o($, Q), fractionDenominatorGapMin: o($, Q), fractionDenomDisplayStyleGapMin: o($, Q), skewedFractionHorizontalGap: o($, Q), skewedFractionVerticalGap: o($, Q), overbarVerticalGap: o($, Q), overbarRuleThickness: o($, Q), overbarExtraAscender: o($, Q), underbarVerticalGap: o($, Q), underbarRuleThickness: o($, Q), underbarExtraDescender: o($, Q), radicalVerticalGap: o($, Q), radicalDisplayStyleVerticalGap: o($, Q), radicalRuleThickness: o($, Q), radicalExtraAscender: o($, Q), radicalKernBeforeDegree: o($, Q), radicalKernAfterDegree: o($, Q), radicalDegreeBottomRaisePercent: $.int16() };
+  return { scriptPercentScaleDown: Z, scriptScriptPercentScaleDown: K, delimitedSubFormulaMinHeight: q, displayOperatorMinHeight: J, mathLeading: c($, Q), axisHeight: c($, Q), accentBaseHeight: c($, Q), flattenedAccentBaseHeight: c($, Q), subscriptShiftDown: c($, Q), subscriptTopMax: c($, Q), subscriptBaselineDropMin: c($, Q), superscriptShiftUp: c($, Q), superscriptShiftUpCramped: c($, Q), superscriptBottomMin: c($, Q), superscriptBaselineDropMax: c($, Q), subSuperscriptGapMin: c($, Q), superscriptBottomMaxWithSubscript: c($, Q), spaceAfterScript: c($, Q), upperLimitGapMin: c($, Q), upperLimitBaselineRiseMin: c($, Q), lowerLimitGapMin: c($, Q), lowerLimitBaselineDropMin: c($, Q), stackTopShiftUp: c($, Q), stackTopDisplayStyleShiftUp: c($, Q), stackBottomShiftDown: c($, Q), stackBottomDisplayStyleShiftDown: c($, Q), stackGapMin: c($, Q), stackDisplayStyleGapMin: c($, Q), stretchStackTopShiftUp: c($, Q), stretchStackBottomShiftDown: c($, Q), stretchStackGapAboveMin: c($, Q), stretchStackGapBelowMin: c($, Q), fractionNumeratorShiftUp: c($, Q), fractionNumeratorDisplayStyleShiftUp: c($, Q), fractionDenominatorShiftDown: c($, Q), fractionDenominatorDisplayStyleShiftDown: c($, Q), fractionNumeratorGapMin: c($, Q), fractionNumDisplayStyleGapMin: c($, Q), fractionRuleThickness: c($, Q), fractionDenominatorGapMin: c($, Q), fractionDenomDisplayStyleGapMin: c($, Q), skewedFractionHorizontalGap: c($, Q), skewedFractionVerticalGap: c($, Q), overbarVerticalGap: c($, Q), overbarRuleThickness: c($, Q), overbarExtraAscender: c($, Q), underbarVerticalGap: c($, Q), underbarRuleThickness: c($, Q), underbarExtraDescender: c($, Q), radicalVerticalGap: c($, Q), radicalDisplayStyleVerticalGap: c($, Q), radicalRuleThickness: c($, Q), radicalExtraAscender: c($, Q), radicalKernBeforeDegree: c($, Q), radicalKernAfterDegree: c($, Q), radicalDegreeBottomRaisePercent: $.int16() };
+}
+function nV($) {
+  let Q = $.uint16(), Z = $.uint16(), K = [];
+  for (let J = 0;J < Z; J++)
+    K.push(c($, $));
+  return { coverage: s($, Q), values: K };
 }
 function pV($) {
   let Q = $.uint16(), Z = $.uint16(), K = [];
   for (let J = 0;J < Z; J++)
-    K.push(o($, $));
-  return { coverage: s($, Q), values: K };
-}
-function cV($) {
-  let Q = $.uint16(), Z = $.uint16(), K = [];
-  for (let J = 0;J < Z; J++)
-    K.push(o($, $));
+    K.push(c($, $));
   return { coverage: s($, Q), values: K };
 }
 function _5($, Q) {
   let Z = $.sliceFrom(Q), K = Z.uint16(), q = [];
   for (let U = 0;U < K; U++)
-    q.push(o(Z, Z));
+    q.push(c(Z, Z));
   let J = [];
   for (let U = 0;U < K + 1; U++)
-    J.push(o(Z, Z));
+    J.push(c(Z, Z));
   return { correctionHeights: q, kernValues: J };
 }
-function oV($) {
+function cV($) {
   let Q = $.uint16(), Z = $.uint16(), K = [];
   for (let U = 0;U < Z; U++)
     K.push({ topRightOffset: $.uint16(), topLeftOffset: $.uint16(), bottomRightOffset: $.uint16(), bottomLeftOffset: $.uint16() });
   let q = s($, Q), J = K.map((U) => ({ topRight: U.topRightOffset !== 0 ? _5($, U.topRightOffset) : null, topLeft: U.topLeftOffset !== 0 ? _5($, U.topLeftOffset) : null, bottomRight: U.bottomRightOffset !== 0 ? _5($, U.bottomRightOffset) : null, bottomLeft: U.bottomLeftOffset !== 0 ? _5($, U.bottomLeftOffset) : null }));
   return { coverage: q, kernInfo: J };
 }
-function iV($) {
+function oV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16(), J = null;
   if (Q !== 0)
-    J = pV($.sliceFrom(Q));
+    J = nV($.sliceFrom(Q));
   let U = null;
   if (Z !== 0)
-    U = cV($.sliceFrom(Z));
+    U = pV($.sliceFrom(Z));
   let W = null;
   if (K !== 0)
     W = { coverage: s($, K) };
   let H = null;
   if (q !== 0)
-    H = oV($.sliceFrom(q));
+    H = cV($.sliceFrom(q));
   return { italicsCorrection: J, topAccentAttachment: U, extendedShapeCoverage: W, kernInfo: H };
 }
-function sV($) {
-  let Q = o($, $), Z = $.uint16(), K = [];
+function iV($) {
+  let Q = c($, $), Z = $.uint16(), K = [];
   for (let q = 0;q < Z; q++)
     K.push({ glyphId: $.uint16(), startConnectorLength: $.uint16(), endConnectorLength: $.uint16(), fullAdvance: $.uint16(), partFlags: $.uint16() });
   return { italicsCorrection: Q, parts: K };
@@ -44619,10 +44630,10 @@ function TU($) {
     K.push({ variantGlyph: $.uint16(), advanceMeasurement: $.uint16() });
   let q = null;
   if (Q !== 0)
-    q = sV($.sliceFrom(Q));
+    q = iV($.sliceFrom(Q));
   return { glyphAssembly: q, variants: K };
 }
-function rV($) {
+function sV($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16(), J = $.uint16(), U = [];
   for (let X = 0;X < q; X++)
     U.push($.uint16());
@@ -44635,16 +44646,16 @@ function rV($) {
 function b1($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = $.uint16(), J = $.uint16(), U = null;
   if (K !== 0)
-    U = nV($.sliceFrom(K));
+    U = dV($.sliceFrom(K));
   let W = null;
   if (q !== 0)
-    W = iV($.sliceFrom(q));
+    W = oV($.sliceFrom(q));
   let H = null;
   if (J !== 0)
-    H = rV($.sliceFrom(J));
+    H = sV($.sliceFrom(J));
   return { majorVersion: Q, minorVersion: Z, constants: U, glyphInfo: W, variants: H };
 }
-function aV($, Q) {
+function rV($, Q) {
   let Z = $.glyphInfo?.italicsCorrection;
   if (!Z)
     return null;
@@ -44653,7 +44664,7 @@ function aV($, Q) {
     return null;
   return Z.values[K] ?? null;
 }
-function tV($, Q) {
+function aV($, Q) {
   let Z = $.glyphInfo?.topAccentAttachment;
   if (!Z)
     return null;
@@ -44662,13 +44673,13 @@ function tV($, Q) {
     return null;
   return Z.values[K] ?? null;
 }
-function eV($, Q) {
+function tV($, Q) {
   let Z = $.glyphInfo?.extendedShapeCoverage;
   if (!Z)
     return false;
   return Z.coverage.get(Q) !== null;
 }
-function $X($, Q) {
+function eV($, Q) {
   let Z = $.variants;
   if (!Z?.vertGlyphCoverage)
     return null;
@@ -44677,7 +44688,7 @@ function $X($, Q) {
     return null;
   return Z.vertGlyphConstruction[K]?.variants ?? null;
 }
-function QX($, Q) {
+function $X($, Q) {
   let Z = $.variants;
   if (!Z?.horizGlyphCoverage)
     return null;
@@ -44686,7 +44697,7 @@ function QX($, Q) {
     return null;
   return Z.horizGlyphConstruction[K]?.variants ?? null;
 }
-function ZX($, Q) {
+function QX($, Q) {
   let Z = $.variants;
   if (!Z?.vertGlyphCoverage)
     return null;
@@ -44695,7 +44706,7 @@ function ZX($, Q) {
     return null;
   return Z.vertGlyphConstruction[K]?.glyphAssembly ?? null;
 }
-function KX($, Q) {
+function ZX($, Q) {
   let Z = $.variants;
   if (!Z?.horizGlyphCoverage)
     return null;
@@ -44726,57 +44737,57 @@ function PU($) {
     return { version: Q, chains: [] };
   let Z = $.uint32(), K = [];
   for (let q = 0;q < Z; q++) {
-    let J = qX($);
+    let J = KX($);
     K.push(J);
   }
   return { version: Q, chains: K };
 }
-function qX($) {
+function KX($) {
   let Q = $.uint32(), Z = $.uint32(), K = $.uint32(), q = $.uint32(), J = [];
   for (let W = 0;W < K; W++)
     J.push({ featureType: $.uint16(), featureSetting: $.uint16(), enableFlags: $.uint32(), disableFlags: $.uint32() });
   let U = [];
   for (let W = 0;W < q; W++) {
-    let H = JX($);
+    let H = qX($);
     if (H)
       U.push(H);
   }
   return { defaultFlags: Q, features: J, subtables: U };
 }
-function JX($) {
+function qX($) {
   let Q = $.uint32(), Z = $.uint32(), K = $.uint32(), q = Z & 255, J = { vertical: (Z & 2147483648) !== 0, descending: (Z & 1073741824) !== 0, logical: (Z & 268435456) !== 0 }, W = $.offset + Q - 12, H = null;
   switch (q) {
     case 0:
-      H = _X($, J, K);
-      break;
-    case 1:
-      H = WX($, J, K);
-      break;
-    case 2:
       H = HX($, J, K);
       break;
-    case 4:
+    case 1:
       H = UX($, J, K);
       break;
+    case 2:
+      H = WX($, J, K);
+      break;
+    case 4:
+      H = JX($, J, K);
+      break;
     case 5:
-      H = NX($, J, K);
+      H = _X($, J, K);
       break;
   }
   return $.seek(W), H;
 }
-function UX($, Q, Z) {
-  let K = VX($);
+function JX($, Q, Z) {
+  let K = NX($);
   return { type: 4, coverage: Q, subFeatureFlags: Z, lookupTable: K };
 }
-function WX($, Q, Z) {
+function UX($, Q, Z) {
   let K = $.offset, q = $.uint32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = $.offset32(), _ = N5($.sliceFrom(K + J));
   return { type: 1, coverage: Q, subFeatureFlags: Z, stateTable: { nClasses: q, classTable: _, stateArray: [] }, substitutionTable: [] };
 }
-function HX($, Q, Z) {
+function WX($, Q, Z) {
   let K = $.offset, q = $.uint32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = $.offset32(), _ = $.offset32(), N = $.offset32(), V = N5($.sliceFrom(K + J));
   return { type: 2, coverage: Q, subFeatureFlags: Z, stateTable: { nClasses: q, classTable: V, stateArray: [] }, ligatureActions: [], components: [], ligatures: [] };
 }
-function _X($, Q, Z) {
+function HX($, Q, Z) {
   let K = $.offset, q = $.uint32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = N5($.sliceFrom(K + J)), _ = $.sliceFrom(K + U), N = $.sliceFrom(K + W), V = [], X = 256;
   for (let Y = 0;Y < 256; Y++)
     V.push({ newState: N.uint16(), flags: N.uint16() });
@@ -44791,7 +44802,7 @@ function _X($, Q, Z) {
   }
   return { type: 0, coverage: Q, subFeatureFlags: Z, stateTable: { nClasses: q, classTable: H, stateArray: z } };
 }
-function NX($, Q, Z) {
+function _X($, Q, Z) {
   let K = $.offset, q = $.uint32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = $.offset32(), _ = N5($.sliceFrom(K + J)), N = $.sliceFrom(K + H), V = [], X = 1024;
   for (let L = 0;L < 1024; L++)
     try {
@@ -44813,7 +44824,7 @@ function NX($, Q, Z) {
   }
   return { type: 5, coverage: Q, subFeatureFlags: Z, stateTable: { nClasses: q, classTable: _, stateArray: E }, insertionGlyphs: V };
 }
-function VX($) {
+function NX($) {
   let Q = $.uint16(), Z = new Map;
   switch (Q) {
     case 0:
@@ -44884,10 +44895,10 @@ function IU($) {
   for (let H = 0;H < q; H++)
     if (U.push({ valueTag: $.tag(), deltaSetOuterIndex: $.uint16(), deltaSetInnerIndex: $.uint16() }), K > 8)
       $.skip(K - 8);
-  let W = XX($.sliceFrom(J));
+  let W = VX($.sliceFrom(J));
   return { majorVersion: Q, minorVersion: Z, itemVariationStore: W, valueRecords: U };
 }
-function XX($) {
+function VX($) {
   let Q = $.uint16(), Z = $.offset32(), K = $.uint16(), q = [];
   for (let N = 0;N < K; N++)
     q.push($.offset32());
@@ -44942,33 +44953,33 @@ function N0($, Q, Z) {
   }
   return Math.round(H);
 }
-function zX($, Q) {
+function XX($, Q) {
   return N0($, _0.hasc, Q);
 }
-function GX($, Q) {
+function zX($, Q) {
   return N0($, _0.hdsc, Q);
 }
-function YX($, Q) {
+function GX($, Q) {
   return N0($, _0.xhgt, Q);
 }
-function jX($, Q) {
+function YX($, Q) {
   return N0($, _0.cpht, Q);
 }
 var u6 = { Copyright: 0, FontFamily: 1, FontSubfamily: 2, UniqueID: 3, FullName: 4, Version: 5, PostScriptName: 6, Trademark: 7, Manufacturer: 8, Designer: 9, Description: 10, ManufacturerURL: 11, DesignerURL: 12, License: 13, LicenseURL: 14, Reserved: 15, TypographicFamily: 16, TypographicSubfamily: 17, CompatibleFullName: 18, SampleText: 19, PostScriptCIDFindfontName: 20, WWSFamily: 21, WWSSubfamily: 22, LightBackgroundPalette: 23, DarkBackgroundPalette: 24, VariationsPostScriptNamePrefix: 25 };
 var F9 = { Unicode: 0, Macintosh: 1, Reserved: 2, Windows: 3 };
-var EX = { Symbol: 0, UnicodeBMP: 1, ShiftJIS: 2, PRC: 3, Big5: 4, Wansung: 5, Johab: 6, UnicodeFullRepertoire: 10 };
+var jX = { Symbol: 0, UnicodeBMP: 1, ShiftJIS: 2, PRC: 3, Big5: 4, Wansung: 5, Johab: 6, UnicodeFullRepertoire: 10 };
 function V5($) {
   let Q = $.uint16(), Z = $.uint16(), K = $.uint16(), q = [], J = [];
   for (let U = 0;U < Z; U++)
     J.push({ platformId: $.uint16(), encodingId: $.uint16(), languageId: $.uint16(), nameId: $.uint16(), length: $.uint16(), offset: $.uint16() });
   for (let U = 0;U < J.length; U++) {
-    let W = J[U], H = $.sliceFrom(K + W.offset), _ = wX(H, W.length, W.platformId, W.encodingId);
+    let W = J[U], H = $.sliceFrom(K + W.offset), _ = EX(H, W.length, W.platformId, W.encodingId);
     if (_ !== null)
       q.push({ platformId: W.platformId, encodingId: W.encodingId, languageId: W.languageId, nameId: W.nameId, value: _ });
   }
   return { format: Q, records: q };
 }
-function wX($, Q, Z, K) {
+function EX($, Q, Z, K) {
   if (Z === F9.Unicode || Z === F9.Windows && (K === 1 || K === 10)) {
     let q = [];
     for (let J = 0;J < Q; J += 2) {
@@ -45013,23 +45024,23 @@ function x6($, Q, Z) {
   }
   return null;
 }
-function AX($) {
+function wX($) {
   return x6($, u6.TypographicFamily) ?? x6($, u6.FontFamily);
 }
-function LX($) {
+function AX($) {
   return x6($, u6.TypographicSubfamily) ?? x6($, u6.FontSubfamily);
 }
-function FX($) {
+function LX($) {
   return x6($, u6.FullName);
 }
-function DX($) {
+function FX($) {
   return x6($, u6.PostScriptName);
 }
-function BX($) {
+function DX($) {
   return x6($, u6.Version);
 }
-var RX = { Thin: 100, ExtraLight: 200, Light: 300, Normal: 400, Medium: 500, SemiBold: 600, Bold: 700, ExtraBold: 800, Black: 900 };
-var MX = { UltraCondensed: 1, ExtraCondensed: 2, Condensed: 3, SemiCondensed: 4, Normal: 5, SemiExpanded: 6, Expanded: 7, ExtraExpanded: 8, UltraExpanded: 9 };
+var BX = { Thin: 100, ExtraLight: 200, Light: 300, Normal: 400, Medium: 500, SemiBold: 600, Bold: 700, ExtraBold: 800, Black: 900 };
+var RX = { UltraCondensed: 1, ExtraCondensed: 2, Condensed: 3, SemiCondensed: 4, Normal: 5, SemiExpanded: 6, Expanded: 7, ExtraExpanded: 8, UltraExpanded: 9 };
 var z5 = { Italic: 1, Underscore: 2, Negative: 4, Outlined: 8, Strikeout: 16, Bold: 32, Regular: 64, UseTypoMetrics: 128, WWS: 256, Oblique: 512 };
 var X5 = { InstallableEmbedding: 0, RestrictedLicense: 2, PreviewAndPrint: 4, Editable: 8, NoSubsetting: 256, BitmapOnly: 512 };
 function u1($) {
@@ -45045,16 +45056,16 @@ function u1($) {
     k.usLowerOpticalPointSize = $.uint16(), k.usUpperOpticalPointSize = $.uint16();
   return k;
 }
-function TX($) {
+function MX($) {
   return ($.fsSelection & z5.Italic) !== 0;
 }
-function OX($) {
+function TX($) {
   return ($.fsSelection & z5.Bold) !== 0;
 }
-function PX($) {
+function OX($) {
   return ($.fsSelection & z5.UseTypoMetrics) !== 0;
 }
-function IX($) {
+function PX($) {
   let Q = $.fsType;
   if ((Q & X5.RestrictedLicense) !== 0)
     return "restricted";
@@ -45088,7 +45099,7 @@ function x1($) {
   }
   return X;
 }
-function vX($, Q) {
+function IX($, Q) {
   if ($.version === 1) {
     let Z = vU[Q];
     return Z !== undefined ? Z : null;
@@ -45104,7 +45115,7 @@ function vX($, Q) {
   }
   return null;
 }
-function kX($) {
+function vX($) {
   return $.isFixedPitch !== 0;
 }
 var f1 = { PNG: "png ", JPG: "jpg ", TIFF: "tiff", PDF: "pdf ", MASK: "mask", DUPE: "dupe" };
@@ -45114,12 +45125,12 @@ function kU($, Q) {
     U.push($.uint32());
   let W = [];
   for (let H = 0;H < U.length; H++) {
-    let _ = U[H], N = CX($, Z + _, Q);
+    let _ = U[H], N = kX($, Z + _, Q);
     W.push(N);
   }
   return { version: K, flags: q, strikes: W };
 }
-function CX($, Q, Z) {
+function kX($, Q, Z) {
   let K = $.sliceFrom(Q), q = K.uint16(), J = K.uint16(), U = [];
   for (let H = 0;H <= Z; H++)
     U.push(K.uint32());
@@ -45136,7 +45147,7 @@ function CX($, Q, Z) {
   }
   return { ppem: q, ppi: J, glyphData: W };
 }
-function SX($, Q, Z) {
+function CX($, Q, Z) {
   let K = null, q = 1 / 0;
   for (let J = 0;J < $.strikes.length; J++) {
     let U = $.strikes[J], W = Math.abs(U.ppem - Z);
@@ -45150,10 +45161,10 @@ function SX($, Q, Z) {
 function CU($, Q) {
   return $.strikes.find((Z) => Z.ppem === Q) ?? null;
 }
-function hX($) {
+function SX($) {
   return $.strikes.map((Q) => Q.ppem).sort((Q, Z) => Q - Z);
 }
-function yX($, Q, Z) {
+function hX($, Q, Z) {
   if (Z !== undefined)
     return CU($, Z)?.glyphData.has(Q) ?? false;
   for (let K = 0;K < $.strikes.length; K++)
@@ -45187,7 +45198,7 @@ function V0($) {
 function l1($) {
   return $.sfntVersion === 65536 || $.sfntVersion === 1953658213;
 }
-function bX($) {
+function yX($) {
   return $.sfntVersion === 1330926671;
 }
 var d1 = { OlderSiblingFontAttribute: 1, ElidableAxisValueName: 2 };
@@ -45208,14 +45219,14 @@ function hU($) {
     for (let G = 0;G < W; G++)
       z.push(X.uint16());
     for (let G = 0;G < z.length; G++) {
-      let Y = z[G], j = $.sliceFrom(Q + H + Y), E = mX(j);
+      let Y = z[G], j = $.sliceFrom(Q + H + Y), E = bX(j);
       if (E)
         V.push(E);
     }
   }
   return { majorVersion: Z, minorVersion: K, designAxisCount: J, designAxes: N, axisValueCount: W, axisValues: V, elidedFallbackNameID: _ };
 }
-function mX($) {
+function bX($) {
   switch ($.uint16()) {
     case 1:
       return { format: 1, axisIndex: $.uint16(), flags: $.uint16(), valueNameID: $.uint16(), value: $.fixed() };
@@ -45233,29 +45244,29 @@ function mX($) {
       return null;
   }
 }
-function gX($, Q) {
+function mX($, Q) {
   return $.designAxes.find((Z) => Z.axisTag === Q) ?? null;
 }
-function uX($, Q) {
+function gX($, Q) {
   return $.designAxes.findIndex((Z) => Z.axisTag === Q);
 }
-function xX($, Q) {
+function uX($, Q) {
   return $.axisValues.filter((Z) => {
     if (Z.format === 4)
       return Z.axisValues.some((K) => K.axisIndex === Q);
     return Z.axisIndex === Q;
   });
 }
-function fX($, Q) {
+function xX($, Q) {
   return $.axisValues.find((Z) => Z.valueNameID === Q) ?? null;
 }
-function lX($) {
+function fX($) {
   return ($.flags & d1.ElidableAxisValueName) !== 0;
 }
-function dX($) {
+function lX($) {
   return ($.flags & d1.OlderSiblingFontAttribute) !== 0;
 }
-function nX($) {
+function dX($) {
   switch ($.format) {
     case 1:
     case 3:
@@ -45266,7 +45277,7 @@ function nX($) {
       return null;
   }
 }
-function pX($, Q) {
+function nX($, Q) {
   switch ($.format) {
     case 1:
     case 3: {
@@ -45298,7 +45309,7 @@ function yU($) {
     let _ = J[H], V = K.sliceFrom(_.svgDocOffset).bytes(_.svgDocLength), X;
     if (V[0] === 31 && V[1] === 139)
       try {
-        let z = iX(V);
+        let z = oX(V);
         X = W.decode(z);
       } catch {
         X = W.decode(V);
@@ -45317,10 +45328,10 @@ function bU($, Q) {
   }
   return null;
 }
-function cX($, Q) {
+function pX($, Q) {
   return bU($, Q) !== null;
 }
-function oX($) {
+function cX($) {
   let Q = [];
   for (let Z = 0;Z < $.documentRecords.length; Z++) {
     let K = $.documentRecords[Z];
@@ -45329,7 +45340,7 @@ function oX($) {
   }
   return Q;
 }
-function iX($) {
+function oX($) {
   if (typeof DecompressionStream < "u")
     return $;
   return $;
@@ -45418,7 +45429,7 @@ function n1($, Q, Z) {
   }
   return 0;
 }
-function sX($, Q, Z, K = 0, q = false) {
+function iX($, Q, Z, K = 0, q = false) {
   let J = q ? $.vertData : $.horizData;
   if (!J)
     return;
@@ -45445,7 +45456,7 @@ function fU($, Q, Z) {
     q.push($.int16());
   return { vMetrics: K, topSideBearings: q };
 }
-function rX($, Q) {
+function sX($, Q) {
   if (Q < $.vMetrics.length) {
     let U = $.vMetrics[Q];
     if (U)
@@ -45460,7 +45471,7 @@ function lU($) {
     J.push({ glyphIndex: $.uint16(), vertOriginY: $.int16() });
   return J.sort((U, W) => U.glyphIndex - W.glyphIndex), { majorVersion: Q, minorVersion: Z, defaultVertOriginY: K, vertOriginYMetrics: J };
 }
-function aX($, Q) {
+function rX($, Q) {
   let Z = $.vertOriginYMetrics, K = 0, q = Z.length - 1;
   while (K <= q) {
     let J = K + q >>> 1, U = Z[J];
@@ -45475,7 +45486,7 @@ function aX($, Q) {
   }
   return $.defaultVertOriginY;
 }
-function tX($, Q) {
+function aX($, Q) {
   let Z = $.vertOriginYMetrics, K = 0, q = Z.length - 1;
   while (K <= q) {
     let J = K + q >>> 1, U = Z[J];
@@ -45491,10 +45502,10 @@ function tX($, Q) {
   return false;
 }
 function dU($) {
-  let Q = $.uint16(), Z = $.uint16(), K = $.offset32(), q = $.offset32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = eX($.sliceFrom(K)), _ = q !== 0 ? G5($.sliceFrom(q)) : null, N = J !== 0 ? G5($.sliceFrom(J)) : null, V = U !== 0 ? G5($.sliceFrom(U)) : null, X = W !== 0 ? G5($.sliceFrom(W)) : null;
+  let Q = $.uint16(), Z = $.uint16(), K = $.offset32(), q = $.offset32(), J = $.offset32(), U = $.offset32(), W = $.offset32(), H = tX($.sliceFrom(K)), _ = q !== 0 ? G5($.sliceFrom(q)) : null, N = J !== 0 ? G5($.sliceFrom(J)) : null, V = U !== 0 ? G5($.sliceFrom(U)) : null, X = W !== 0 ? G5($.sliceFrom(W)) : null;
   return { majorVersion: Q, minorVersion: Z, itemVariationStore: H, advanceHeightMapping: _, tsbMapping: N, bsbMapping: V, vOrgMapping: X };
 }
-function eX($) {
+function tX($) {
   let Q = $.uint16(), Z = $.offset32(), K = $.uint16(), q = [];
   for (let N = 0;N < K; N++)
     q.push($.offset32());
@@ -45540,7 +45551,7 @@ function G5($) {
   }
   return { format: Q, mapCount: K, entryFormat: Z, innerIndexBitCount: q, mapData: U };
 }
-function $2($, Q, Z) {
+function eX($, Q, Z) {
   let K = $.advanceHeightMapping, q, J;
   if (K && Q < K.mapData.length) {
     let U = K.mapData[Q];
@@ -45551,7 +45562,7 @@ function $2($, Q, Z) {
     q = 0, J = Q;
   return Y5($.itemVariationStore, q, J, Z);
 }
-function Q2($, Q, Z) {
+function $2($, Q, Z) {
   let K = $.tsbMapping;
   if (!K)
     return 0;
@@ -45562,7 +45573,7 @@ function Q2($, Q, Z) {
     return 0;
   return Y5($.itemVariationStore, q.outer, q.inner, Z);
 }
-function Z2($, Q, Z) {
+function Q2($, Q, Z) {
   let K = $.bsbMapping;
   if (!K)
     return 0;
@@ -45573,7 +45584,7 @@ function Z2($, Q, Z) {
     return 0;
   return Y5($.itemVariationStore, q.outer, q.inner, Z);
 }
-function K2($, Q, Z) {
+function Z2($, Q, Z) {
   let K = $.vOrgMapping;
   if (!K)
     return 0;
@@ -45601,13 +45612,13 @@ function Y5($, Q, Z, K) {
   }
   return Math.round(U);
 }
-var q2 = 2001684038;
-var J2 = 2001684018;
+var K2 = 2001684038;
+var q2 = 2001684018;
 function nU($) {
-  return new DataView($).getUint32(0, false) === J2;
+  return new DataView($).getUint32(0, false) === q2;
 }
 function pU($) {
-  return new DataView($).getUint32(0, false) === q2;
+  return new DataView($).getUint32(0, false) === K2;
 }
 
 class p1 {
@@ -45637,8 +45648,7 @@ class p1 {
             let W = Q.slice(U.offset, U.length), H = V5(W);
             q.fullName = x6(H, u6.FullName) ?? undefined, q.family = x6(H, u6.FontFamily) ?? undefined, q.subfamily = x6(H, u6.FontSubfamily) ?? undefined, q.postScriptName = x6(H, u6.PostScriptName) ?? undefined;
           }
-        } catch {
-        }
+        } catch {}
       $.push(q);
     }
     return this.namesCache = $, $;
@@ -46234,28 +46244,28 @@ function iU($, Q, Z) {
     if (H && Y === "extend") {
       let M = k1(L, q);
       if (M.length > 0) {
-        let R = U2(Q, M[0], E, $);
+        let R = J2(Q, M[0], E, $);
         E -= R.totalExtension, j.push(...R.adjustments);
       }
     }
   }
   let A = $.glyphId(32);
   if (A !== 0) {
-    let F = H2(Q, A, E, Y === "shrink" ? _ : N);
+    let F = W2(Q, A, E, Y === "shrink" ? _ : N);
     E -= F.totalAdjustment, j.push(...F.adjustments);
   }
   if (V && Math.abs(E) > 1) {
-    let F = _2(Q, E, X);
+    let F = H2(Q, E, X);
     E -= F.totalAdjustment, j.push(...F.adjustments);
   }
   let D = j5(Q);
   return { success: Math.abs(E) < 1, finalWidth: D, delta: K - D, priorityLevel: w, adjustments: j };
 }
-function U2($, Q, Z, K) {
+function J2($, Q, Z, K) {
   let q = [], J = 0, U = [];
   for (let N = 0;N < $.infos.length - 1; N++) {
     let V = $.infos[N];
-    if (W2(V.codepoint))
+    if (U2(V.codepoint))
       U.push(N);
   }
   if (U.length === 0)
@@ -46272,10 +46282,10 @@ function U2($, Q, Z, K) {
   }
   return { totalExtension: J, adjustments: q };
 }
-function W2($) {
+function U2($) {
   return $ >= 1568 && $ <= 1791;
 }
-function H2($, Q, Z, K) {
+function W2($, Q, Z, K) {
   let q = [], J = 0, U = [], W = 0;
   for (let X = 0;X < $.infos.length; X++)
     if ($.infos[X]?.glyphId === Q)
@@ -46291,7 +46301,7 @@ function H2($, Q, Z, K) {
     q.push({ type: "spacing", glyphIndices: U, value: V });
   return { totalAdjustment: J, adjustments: q };
 }
-function _2($, Q, Z) {
+function H2($, Q, Z) {
   let K = [], q = $.infos.length;
   if (q <= 1)
     return { totalAdjustment: 0, adjustments: [] };
@@ -46302,7 +46312,7 @@ function _2($, Q, Z) {
     K.push({ type: "spacing", glyphIndices: H, value: W });
   return { totalAdjustment: _, adjustments: K };
 }
-function N2($, Q, Z) {
+function _2($, Q, Z) {
   let K = [], q = [];
   if ($.infos.length === 0)
     return { lines: [], breakPoints: [] };
@@ -46336,7 +46346,7 @@ function cU($, Q, Z) {
     K.infos.push({ ...$.infos[q] }), K.positions.push({ ...$.positions[q] });
   return K;
 }
-function V2($, Q, Z) {
+function N2($, Q, Z) {
   let K = [];
   for (let q = 0;q < Q.length; q++) {
     let J = Q[q];
@@ -46363,7 +46373,7 @@ function X0($, Q) {
   }
   return null;
 }
-function X2($, Q, Z, K) {
+function V2($, Q, Z, K) {
   if (!$ || !K)
     return Z;
   let q = X0($, K);
@@ -46374,7 +46384,7 @@ function X2($, Q, Z, K) {
     return J.alternateFeature.lookupListIndices;
   return Z;
 }
-function z2($, Q, Z, K) {
+function X2($, Q, Z, K) {
   if (!$ || !K)
     return Q;
   let q = X0($, K);
@@ -46394,9 +46404,9 @@ function z2($, Q, Z, K) {
   return J;
 }
 G6();
-var G2 = [0, 85, 86, 85, 0];
+var z2 = [0, 85, 86, 85, 0];
 var rU = [8, 77, 86, 77, 8];
-var Y2 = [0, 64, 128, 64, 0];
+var G2 = [0, 64, 128, 64, 0];
 var aU;
 ((q) => {
   q[q.RGB = 0] = "RGB";
@@ -46404,21 +46414,21 @@ var aU;
   q[q.RGB_V = 2] = "RGB_V";
   q[q.BGR_V = 3] = "BGR_V";
 })(aU ||= {});
-function j2($, Q, Z, K, q, J, U = 0, W = rU) {
+function Y2($, Q, Z, K, q, J, U = 0, W = rU) {
   if (U === 2 || U === 3)
-    return E2($, Q, Z, K, q, J, U, W);
+    return j2($, Q, Z, K, q, J, U, W);
   let _ = Q * 3, N = r(_, Z, 1), V = new Q9;
   V.setClip(0, 0, _, Z), V.reset(), F8(V, $, K * 3, q * 3, J, true), V.sweep(N);
   let X = r(Q, Z, 2);
-  return w2(N, X, W, U === 1), X;
+  return E2(N, X, W, U === 1), X;
 }
-function E2($, Q, Z, K, q, J, U, W) {
+function j2($, Q, Z, K, q, J, U, W) {
   let H = Z * 3, _ = r(Q, H, 1), N = new Q9;
   N.setClip(0, 0, Q, H), N.reset(), F8(N, $, K, q, J * 3, true), N.sweep(_);
   let V = r(Q, Z, 3);
-  return A2(_, V, W, U === 3), V;
+  return w2(_, V, W, U === 3), V;
 }
-function w2($, Q, Z, K) {
+function E2($, Q, Z, K) {
   let [q, J, U, W, H] = Z, _ = q + J + U + W + H;
   for (let N = 0;N < Q.rows; N++) {
     let V = N * $.pitch, X = N * Q.pitch;
@@ -46431,7 +46441,7 @@ function w2($, Q, Z, K) {
     }
   }
 }
-function A2($, Q, Z, K) {
+function w2($, Q, Z, K) {
   let [q, J, U, W, H] = Z, _ = q + J + U + W + H;
   for (let N = 0;N < Q.rows; N++) {
     let V = N * 3, X = N * Q.pitch;
@@ -46444,7 +46454,7 @@ function A2($, Q, Z, K) {
     }
   }
 }
-function L2($, Q = [255, 255, 255], Z = [0, 0, 0]) {
+function A2($, Q = [255, 255, 255], Z = [0, 0, 0]) {
   let K = new Uint8Array($.width * $.rows * 4), [q, J, U] = Q, [W, H, _] = Z;
   for (let N = 0;N < $.rows; N++) {
     let V = N * $.pitch, X = N * $.width * 4;
@@ -46488,9 +46498,9 @@ function G8($) {
       return 0;
   }
   if ($ >= 768 && $ <= 879)
-    return T2($);
+    return M2($);
   if ($ >= 1425 && $ <= 1469)
-    return R2($);
+    return B2($);
   if ($ === 1471)
     return 23;
   if ($ === 1473)
@@ -46504,7 +46514,7 @@ function G8($) {
   if ($ === 1479)
     return 18;
   if ($ >= 1611 && $ <= 1631)
-    return M2($);
+    return R2($);
   if ($ === 1648)
     return 35;
   if ($ >= 1552 && $ <= 1562)
@@ -46594,13 +46604,13 @@ function G8($) {
   if ($ === 4154)
     return 9;
   if ($ >= 12330 && $ <= 12335)
-    return F2($);
+    return L2($);
   if ($ >= 12441 && $ <= 12442)
     return 8;
   if ($ >= 6832 && $ <= 6911)
-    return D2($);
+    return F2($);
   if ($ >= 7616 && $ <= 7679)
-    return B2($);
+    return D2($);
   if ($ >= 65056 && $ <= 65071)
     return 230;
   return 0;
@@ -46657,7 +46667,7 @@ function eU($) {
     return 230;
   return 9;
 }
-function F2($) {
+function L2($) {
   if ($ === 12330)
     return 218;
   if ($ === 12331)
@@ -46670,7 +46680,7 @@ function F2($) {
     return 224;
   return 224;
 }
-function D2($) {
+function F2($) {
   if ($ >= 6832 && $ <= 6846)
     return 230;
   if ($ === 6847)
@@ -46679,7 +46689,7 @@ function D2($) {
     return 220;
   return 230;
 }
-function B2($) {
+function D2($) {
   if ($ >= 7616 && $ <= 7617)
     return 230;
   if ($ === 7618)
@@ -46708,7 +46718,7 @@ function B2($) {
     return 218;
   return 230;
 }
-function R2($) {
+function B2($) {
   if ($ >= 1425 && $ <= 1441)
     return 220;
   if ($ >= 1442 && $ <= 1455)
@@ -46742,7 +46752,7 @@ function R2($) {
     return 21;
   return 22;
 }
-function M2($) {
+function R2($) {
   if ($ === 1611)
     return 27;
   if ($ === 1612)
@@ -46769,7 +46779,7 @@ function M2($) {
     return 230;
   return 230;
 }
-function T2($) {
+function M2($) {
   if ($ >= 768 && $ <= 788)
     return 230;
   if ($ >= 789 && $ <= 789)
@@ -46854,18 +46864,18 @@ function E5($) {
     Z++;
   }
 }
-var O2 = new Map([[192, [65, 768]], [193, [65, 769]], [194, [65, 770]], [195, [65, 771]], [196, [65, 776]], [197, [65, 778]], [199, [67, 807]], [200, [69, 768]], [201, [69, 769]], [202, [69, 770]], [203, [69, 776]], [204, [73, 768]], [205, [73, 769]], [206, [73, 770]], [207, [73, 776]], [209, [78, 771]], [210, [79, 768]], [211, [79, 769]], [212, [79, 770]], [213, [79, 771]], [214, [79, 776]], [217, [85, 768]], [218, [85, 769]], [219, [85, 770]], [220, [85, 776]], [221, [89, 769]], [224, [97, 768]], [225, [97, 769]], [226, [97, 770]], [227, [97, 771]], [228, [97, 776]], [229, [97, 778]], [231, [99, 807]], [232, [101, 768]], [233, [101, 769]], [234, [101, 770]], [235, [101, 776]], [236, [105, 768]], [237, [105, 769]], [238, [105, 770]], [239, [105, 776]], [241, [110, 771]], [242, [111, 768]], [243, [111, 769]], [244, [111, 770]], [245, [111, 771]], [246, [111, 776]], [249, [117, 768]], [250, [117, 769]], [251, [117, 770]], [252, [117, 776]], [253, [121, 769]], [255, [121, 776]], [256, [65, 772]], [257, [97, 772]], [258, [65, 774]], [259, [97, 774]], [260, [65, 808]], [261, [97, 808]], [262, [67, 769]], [263, [99, 769]], [264, [67, 770]], [265, [99, 770]], [266, [67, 775]], [267, [99, 775]], [268, [67, 780]], [269, [99, 780]], [270, [68, 780]], [271, [100, 780]], [274, [69, 772]], [275, [101, 772]], [276, [69, 774]], [277, [101, 774]], [278, [69, 775]], [279, [101, 775]], [280, [69, 808]], [281, [101, 808]], [282, [69, 780]], [283, [101, 780]], [284, [71, 770]], [285, [103, 770]], [286, [71, 774]], [287, [103, 774]], [288, [71, 775]], [289, [103, 775]], [290, [71, 807]], [291, [103, 807]], [292, [72, 770]], [293, [104, 770]], [296, [73, 771]], [297, [105, 771]], [298, [73, 772]], [299, [105, 772]], [300, [73, 774]], [301, [105, 774]], [302, [73, 808]], [303, [105, 808]], [304, [73, 775]], [308, [74, 770]], [309, [106, 770]], [310, [75, 807]], [311, [107, 807]], [313, [76, 769]], [314, [108, 769]], [315, [76, 807]], [316, [108, 807]], [317, [76, 780]], [318, [108, 780]], [323, [78, 769]], [324, [110, 769]], [325, [78, 807]], [326, [110, 807]], [327, [78, 780]], [328, [110, 780]], [332, [79, 772]], [333, [111, 772]], [334, [79, 774]], [335, [111, 774]], [336, [79, 779]], [337, [111, 779]], [340, [82, 769]], [341, [114, 769]], [342, [82, 807]], [343, [114, 807]], [344, [82, 780]], [345, [114, 780]], [346, [83, 769]], [347, [115, 769]], [348, [83, 770]], [349, [115, 770]], [350, [83, 807]], [351, [115, 807]], [352, [83, 780]], [353, [115, 780]], [354, [84, 807]], [355, [116, 807]], [356, [84, 780]], [357, [116, 780]], [360, [85, 771]], [361, [117, 771]], [362, [85, 772]], [363, [117, 772]], [364, [85, 774]], [365, [117, 774]], [366, [85, 778]], [367, [117, 778]], [368, [85, 779]], [369, [117, 779]], [370, [85, 808]], [371, [117, 808]], [372, [87, 770]], [373, [119, 770]], [374, [89, 770]], [375, [121, 770]], [376, [89, 776]], [377, [90, 769]], [378, [122, 769]], [379, [90, 775]], [380, [122, 775]], [381, [90, 780]], [382, [122, 780]], [7840, [65, 803]], [7841, [97, 803]], [7842, [65, 777]], [7843, [97, 777]], [7864, [69, 803]], [7865, [101, 803]], [7866, [69, 777]], [7867, [101, 777]], [7868, [69, 771]], [7869, [101, 771]], [7880, [73, 777]], [7881, [105, 777]], [7882, [73, 803]], [7883, [105, 803]], [7884, [79, 803]], [7885, [111, 803]], [7886, [79, 777]], [7887, [111, 777]], [7908, [85, 803]], [7909, [117, 803]], [7910, [85, 777]], [7911, [117, 777]], [7922, [89, 768]], [7923, [121, 768]], [7924, [89, 803]], [7925, [121, 803]], [7926, [89, 777]], [7927, [121, 777]], [7928, [89, 771]], [7929, [121, 771]], [7936, [945, 787]], [7937, [945, 788]], [7944, [913, 787]], [7945, [913, 788]], [1081, [1080, 774]], [1049, [1048, 774]], [1105, [1077, 776]], [1025, [1045, 776]]]);
+var T2 = new Map([[192, [65, 768]], [193, [65, 769]], [194, [65, 770]], [195, [65, 771]], [196, [65, 776]], [197, [65, 778]], [199, [67, 807]], [200, [69, 768]], [201, [69, 769]], [202, [69, 770]], [203, [69, 776]], [204, [73, 768]], [205, [73, 769]], [206, [73, 770]], [207, [73, 776]], [209, [78, 771]], [210, [79, 768]], [211, [79, 769]], [212, [79, 770]], [213, [79, 771]], [214, [79, 776]], [217, [85, 768]], [218, [85, 769]], [219, [85, 770]], [220, [85, 776]], [221, [89, 769]], [224, [97, 768]], [225, [97, 769]], [226, [97, 770]], [227, [97, 771]], [228, [97, 776]], [229, [97, 778]], [231, [99, 807]], [232, [101, 768]], [233, [101, 769]], [234, [101, 770]], [235, [101, 776]], [236, [105, 768]], [237, [105, 769]], [238, [105, 770]], [239, [105, 776]], [241, [110, 771]], [242, [111, 768]], [243, [111, 769]], [244, [111, 770]], [245, [111, 771]], [246, [111, 776]], [249, [117, 768]], [250, [117, 769]], [251, [117, 770]], [252, [117, 776]], [253, [121, 769]], [255, [121, 776]], [256, [65, 772]], [257, [97, 772]], [258, [65, 774]], [259, [97, 774]], [260, [65, 808]], [261, [97, 808]], [262, [67, 769]], [263, [99, 769]], [264, [67, 770]], [265, [99, 770]], [266, [67, 775]], [267, [99, 775]], [268, [67, 780]], [269, [99, 780]], [270, [68, 780]], [271, [100, 780]], [274, [69, 772]], [275, [101, 772]], [276, [69, 774]], [277, [101, 774]], [278, [69, 775]], [279, [101, 775]], [280, [69, 808]], [281, [101, 808]], [282, [69, 780]], [283, [101, 780]], [284, [71, 770]], [285, [103, 770]], [286, [71, 774]], [287, [103, 774]], [288, [71, 775]], [289, [103, 775]], [290, [71, 807]], [291, [103, 807]], [292, [72, 770]], [293, [104, 770]], [296, [73, 771]], [297, [105, 771]], [298, [73, 772]], [299, [105, 772]], [300, [73, 774]], [301, [105, 774]], [302, [73, 808]], [303, [105, 808]], [304, [73, 775]], [308, [74, 770]], [309, [106, 770]], [310, [75, 807]], [311, [107, 807]], [313, [76, 769]], [314, [108, 769]], [315, [76, 807]], [316, [108, 807]], [317, [76, 780]], [318, [108, 780]], [323, [78, 769]], [324, [110, 769]], [325, [78, 807]], [326, [110, 807]], [327, [78, 780]], [328, [110, 780]], [332, [79, 772]], [333, [111, 772]], [334, [79, 774]], [335, [111, 774]], [336, [79, 779]], [337, [111, 779]], [340, [82, 769]], [341, [114, 769]], [342, [82, 807]], [343, [114, 807]], [344, [82, 780]], [345, [114, 780]], [346, [83, 769]], [347, [115, 769]], [348, [83, 770]], [349, [115, 770]], [350, [83, 807]], [351, [115, 807]], [352, [83, 780]], [353, [115, 780]], [354, [84, 807]], [355, [116, 807]], [356, [84, 780]], [357, [116, 780]], [360, [85, 771]], [361, [117, 771]], [362, [85, 772]], [363, [117, 772]], [364, [85, 774]], [365, [117, 774]], [366, [85, 778]], [367, [117, 778]], [368, [85, 779]], [369, [117, 779]], [370, [85, 808]], [371, [117, 808]], [372, [87, 770]], [373, [119, 770]], [374, [89, 770]], [375, [121, 770]], [376, [89, 776]], [377, [90, 769]], [378, [122, 769]], [379, [90, 775]], [380, [122, 775]], [381, [90, 780]], [382, [122, 780]], [7840, [65, 803]], [7841, [97, 803]], [7842, [65, 777]], [7843, [97, 777]], [7864, [69, 803]], [7865, [101, 803]], [7866, [69, 777]], [7867, [101, 777]], [7868, [69, 771]], [7869, [101, 771]], [7880, [73, 777]], [7881, [105, 777]], [7882, [73, 803]], [7883, [105, 803]], [7884, [79, 803]], [7885, [111, 803]], [7886, [79, 777]], [7887, [111, 777]], [7908, [85, 803]], [7909, [117, 803]], [7910, [85, 777]], [7911, [117, 777]], [7922, [89, 768]], [7923, [121, 768]], [7924, [89, 803]], [7925, [121, 803]], [7926, [89, 777]], [7927, [121, 777]], [7928, [89, 771]], [7929, [121, 771]], [7936, [945, 787]], [7937, [945, 788]], [7944, [913, 787]], [7945, [913, 788]], [1081, [1080, 774]], [1049, [1048, 774]], [1105, [1077, 776]], [1025, [1045, 776]]]);
 function w5($) {
-  return O2.get($) ?? null;
+  return T2.get($) ?? null;
 }
-var P2 = new Map([[65, new Map([[768, 192], [769, 193], [770, 194], [771, 195], [776, 196], [778, 197], [808, 260], [780, 461], [772, 256], [774, 258]])], [67, new Map([[807, 199], [769, 262], [770, 264], [780, 268], [775, 266]])], [69, new Map([[768, 200], [769, 201], [770, 202], [776, 203], [808, 280], [780, 282], [772, 274], [774, 276], [775, 278]])], [73, new Map([[768, 204], [769, 205], [770, 206], [776, 207], [771, 296], [772, 298], [774, 300], [808, 302], [775, 304]])], [78, new Map([[771, 209], [769, 323], [807, 325], [780, 327]])], [79, new Map([[768, 210], [769, 211], [770, 212], [771, 213], [776, 214], [772, 332], [774, 334], [779, 336], [808, 490]])], [85, new Map([[768, 217], [769, 218], [770, 219], [776, 220], [771, 360], [772, 362], [774, 364], [778, 366], [779, 368], [808, 370], [780, 467]])], [89, new Map([[769, 221], [770, 374], [776, 376]])], [97, new Map([[768, 224], [769, 225], [770, 226], [771, 227], [776, 228], [778, 229], [808, 261], [780, 462], [772, 257], [774, 259]])], [99, new Map([[807, 231], [769, 263], [770, 265], [780, 269], [775, 267]])], [101, new Map([[768, 232], [769, 233], [770, 234], [776, 235], [808, 281], [780, 283], [772, 275], [774, 277], [775, 279]])], [105, new Map([[768, 236], [769, 237], [770, 238], [776, 239], [771, 297], [772, 299], [774, 301], [808, 303]])], [110, new Map([[771, 241], [769, 324], [807, 326], [780, 328]])], [111, new Map([[768, 242], [769, 243], [770, 244], [771, 245], [776, 246], [772, 333], [774, 335], [779, 337], [808, 491]])], [117, new Map([[768, 249], [769, 250], [770, 251], [776, 252], [771, 361], [772, 363], [774, 365], [778, 367], [779, 369], [808, 371], [780, 468]])], [121, new Map([[769, 253], [776, 255], [770, 375]])], [83, new Map([[769, 346], [770, 348], [807, 350], [780, 352]])], [115, new Map([[769, 347], [770, 349], [807, 351], [780, 353]])], [90, new Map([[769, 377], [775, 379], [780, 381]])], [122, new Map([[769, 378], [775, 380], [780, 382]])]]);
+var O2 = new Map([[65, new Map([[768, 192], [769, 193], [770, 194], [771, 195], [776, 196], [778, 197], [808, 260], [780, 461], [772, 256], [774, 258]])], [67, new Map([[807, 199], [769, 262], [770, 264], [780, 268], [775, 266]])], [69, new Map([[768, 200], [769, 201], [770, 202], [776, 203], [808, 280], [780, 282], [772, 274], [774, 276], [775, 278]])], [73, new Map([[768, 204], [769, 205], [770, 206], [776, 207], [771, 296], [772, 298], [774, 300], [808, 302], [775, 304]])], [78, new Map([[771, 209], [769, 323], [807, 325], [780, 327]])], [79, new Map([[768, 210], [769, 211], [770, 212], [771, 213], [776, 214], [772, 332], [774, 334], [779, 336], [808, 490]])], [85, new Map([[768, 217], [769, 218], [770, 219], [776, 220], [771, 360], [772, 362], [774, 364], [778, 366], [779, 368], [808, 370], [780, 467]])], [89, new Map([[769, 221], [770, 374], [776, 376]])], [97, new Map([[768, 224], [769, 225], [770, 226], [771, 227], [776, 228], [778, 229], [808, 261], [780, 462], [772, 257], [774, 259]])], [99, new Map([[807, 231], [769, 263], [770, 265], [780, 269], [775, 267]])], [101, new Map([[768, 232], [769, 233], [770, 234], [776, 235], [808, 281], [780, 283], [772, 275], [774, 277], [775, 279]])], [105, new Map([[768, 236], [769, 237], [770, 238], [776, 239], [771, 297], [772, 299], [774, 301], [808, 303]])], [110, new Map([[771, 241], [769, 324], [807, 326], [780, 328]])], [111, new Map([[768, 242], [769, 243], [770, 244], [771, 245], [776, 246], [772, 333], [774, 335], [779, 337], [808, 491]])], [117, new Map([[768, 249], [769, 250], [770, 251], [776, 252], [771, 361], [772, 363], [774, 365], [778, 367], [779, 369], [808, 371], [780, 468]])], [121, new Map([[769, 253], [776, 255], [770, 375]])], [83, new Map([[769, 346], [770, 348], [807, 350], [780, 352]])], [115, new Map([[769, 347], [770, 349], [807, 351], [780, 353]])], [90, new Map([[769, 377], [775, 379], [780, 381]])], [122, new Map([[769, 378], [775, 380], [780, 382]])]]);
 function $W($, Q) {
-  let Z = P2.get($);
+  let Z = O2.get($);
   if (!Z)
     return null;
   return Z.get(Q) ?? null;
 }
-function I2($) {
+function P2($) {
   if ($.length === 0)
     return $;
   let Q = [], Z = 0;
@@ -46901,7 +46911,7 @@ function I2($) {
   }
   return Q;
 }
-function v2($, Q) {
+function I2($, Q) {
   if (Q === 0)
     return $;
   if (Q === 1) {
@@ -46930,7 +46940,7 @@ function v2($, Q) {
       else
         Z.push(q);
     }
-    return E5(Z), I2(Z);
+    return E5(Z), P2(Z);
   }
   if (Q === 3) {
     let Z = [];
@@ -46948,7 +46958,7 @@ function v2($, Q) {
   }
   return $;
 }
-function k2($) {
+function v2($) {
   for (let Q = 0;Q < $.length; Q++) {
     let Z = $[Q];
     if (!Z)
@@ -47002,7 +47012,7 @@ function k2($) {
   return false;
 }
 function o1($, Q, Z) {
-  if (!k2(Q))
+  if (!v2(Q))
     return;
   let K = new Map, q = (J) => {
     let U = K.get(J);
@@ -47025,10 +47035,10 @@ function o1($, Q, Z) {
     if (N < 0)
       continue;
     let V = Q[N], X = Z[N], z = $.advanceWidth(V.glyphId);
-    C2($, U, W, V, X, z, _), W.xAdvance = 0, W.yAdvance = 0;
+    k2($, U, W, V, X, z, _), W.xAdvance = 0, W.yAdvance = 0;
   }
 }
-function C2($, Q, Z, K, q, J, U) {
+function k2($, Q, Z, K, q, J, U) {
   let W = $.advanceWidth(Q.glyphId), H = $.unitsPerEm, _ = (J - W) / 2, N = 0;
   if (U >= 200 && U <= 240)
     N = H * 0.7, _ = (J - W) / 2;
@@ -47060,12 +47070,12 @@ function i1($, Q, Z) {
     let H = $.gdef ? z8($.gdef, J.glyphId) : 0, _ = $.gdef ? z8($.gdef, U.glyphId) : 0;
     if (H === 3 || _ === 3)
       continue;
-    let N = S2($, J.glyphId, U.glyphId);
+    let N = C2($, J.glyphId, U.glyphId);
     if (N !== 0)
       W.xAdvance += N;
   }
 }
-function S2($, Q, Z) {
+function C2($, Q, Z) {
   let K = $.kern;
   if (!K)
     return 0;
@@ -47077,7 +47087,7 @@ function ZW($, Q = true) {
   let Z = `ss${$.toString().padStart(2, "0")}`;
   return { tag: C(Z), enabled: Q };
 }
-function h2($, Q = true) {
+function S2($, Q = true) {
   return $.map((Z) => ZW(Z, Q));
 }
 function KW($, Q = true) {
@@ -47086,25 +47096,25 @@ function KW($, Q = true) {
   let Z = `cv${$.toString().padStart(2, "0")}`;
   return { tag: C(Z), enabled: Q };
 }
-function y2($, Q = true) {
+function h2($, Q = true) {
   return $.map((Z) => KW(Z, Q));
 }
-function b2($ = true) {
+function y2($ = true) {
   return { tag: C("liga"), enabled: $ };
 }
-function m2($ = true) {
+function b2($ = true) {
   return { tag: C("dlig"), enabled: $ };
 }
-function g2($ = true) {
+function m2($ = true) {
   return { tag: C("hlig"), enabled: $ };
 }
-function u2($ = true) {
+function g2($ = true) {
   return { tag: C("calt"), enabled: $ };
 }
-function x2($ = true) {
+function u2($ = true) {
   return { tag: C("salt"), enabled: $ };
 }
-function f2($ = true) {
+function x2($ = true) {
   return { tag: C("swsh"), enabled: $ };
 }
 function qW($ = true) {
@@ -47113,49 +47123,49 @@ function qW($ = true) {
 function JW($ = true) {
   return { tag: C("c2sc"), enabled: $ };
 }
-function l2($ = true) {
+function f2($ = true) {
   return { tag: C("pcap"), enabled: $ };
 }
-function d2($ = true) {
+function l2($ = true) {
   return [qW($), JW($)];
 }
-function n2($ = true) {
+function d2($ = true) {
   return { tag: C("onum"), enabled: $ };
 }
-function p2($ = true) {
+function n2($ = true) {
   return { tag: C("lnum"), enabled: $ };
 }
-function c2($ = true) {
+function p2($ = true) {
   return { tag: C("pnum"), enabled: $ };
 }
-function o2($ = true) {
+function c2($ = true) {
   return { tag: C("tnum"), enabled: $ };
 }
-function i2($ = true) {
+function o2($ = true) {
   return { tag: C("frac"), enabled: $ };
 }
-function s2($ = true) {
+function i2($ = true) {
   return { tag: C("ordn"), enabled: $ };
 }
-function r2($ = true) {
+function s2($ = true) {
   return { tag: C("zero"), enabled: $ };
 }
-function a2($ = true) {
+function r2($ = true) {
   return { tag: C("sups"), enabled: $ };
 }
-function t2($ = true) {
+function a2($ = true) {
   return { tag: C("subs"), enabled: $ };
 }
-function e2($ = true) {
+function t2($ = true) {
   return { tag: C("sinf"), enabled: $ };
 }
-function $z($ = true) {
+function e2($ = true) {
   return { tag: C("case"), enabled: $ };
 }
-function Qz($ = true) {
+function $z($ = true) {
   return { tag: C("cpsp"), enabled: $ };
 }
-function Zz($ = true) {
+function Qz($ = true) {
   return { tag: C("kern"), enabled: $ };
 }
 function UW($ = true) {
@@ -47167,52 +47177,52 @@ function WW($ = true) {
 function HW($ = true) {
   return { tag: C("vkna"), enabled: $ };
 }
-function Kz($ = true) {
+function Zz($ = true) {
   return [UW($), WW($), HW($)];
 }
-function qz($ = true) {
+function Kz($ = true) {
   return { tag: C("ruby"), enabled: $ };
 }
-function Jz($ = true) {
+function qz($ = true) {
   return { tag: C("hwid"), enabled: $ };
 }
-function Uz($ = true) {
+function Jz($ = true) {
   return { tag: C("fwid"), enabled: $ };
 }
-function Wz($ = true) {
+function Uz($ = true) {
   return { tag: C("pwid"), enabled: $ };
 }
-function Hz($ = true) {
+function Wz($ = true) {
   return { tag: C("qwid"), enabled: $ };
 }
-function _z($ = true) {
+function Hz($ = true) {
   return { tag: C("twid"), enabled: $ };
 }
-function Nz($ = true) {
+function _z($ = true) {
   return { tag: C("jp78"), enabled: $ };
 }
-function Vz($ = true) {
+function Nz($ = true) {
   return { tag: C("jp83"), enabled: $ };
 }
-function Xz($ = true) {
+function Vz($ = true) {
   return { tag: C("jp90"), enabled: $ };
 }
-function zz($ = true) {
+function Xz($ = true) {
   return { tag: C("jp04"), enabled: $ };
 }
-function Gz($ = true) {
+function zz($ = true) {
   return { tag: C("smpl"), enabled: $ };
 }
-function Yz($ = true) {
+function Gz($ = true) {
   return { tag: C("trad"), enabled: $ };
 }
 function _W($, Q = true) {
   return { tag: C($), enabled: Q };
 }
-function jz($, Q = true) {
+function Yz($, Q = true) {
   return $.map((Z) => _W(Z, Q));
 }
-function Ez(...$) {
+function jz(...$) {
   let Q = [];
   for (let Z = 0;Z < $.length; Z++) {
     let K = $[Z];
@@ -47223,7 +47233,7 @@ function Ez(...$) {
   }
   return Q;
 }
-var wz = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 1, 2, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 5, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 1, 1, 0, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 2]);
+var Ez = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 1, 2, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 5, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 1, 1, 0, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 2]);
 var z0 = 0;
 var NW = 1;
 var s1 = 2;
@@ -47232,7 +47242,7 @@ var a1 = 4;
 var A5 = 5;
 function r1($) {
   if ($ >= 1536 && $ <= 1791)
-    return wz[$ - 1536];
+    return Ez[$ - 1536];
   if ($ < 1536)
     return z0;
   if ($ >= 1808 && $ <= 1810)
@@ -47321,11 +47331,11 @@ function DW($) {
   return $ === "tibt" || $ === "Tibt";
 }
 var BW = new WeakMap;
-var Az = 64;
-var Lz = ["ccmp", "locl", "rlig", "rclt", "calt", "liga"];
+var wz = 64;
+var Az = ["ccmp", "locl", "rlig", "rclt", "calt", "liga"];
 var RW = ["kern", "mark", "mkmk"];
-function Fz($) {
-  let Q = new Set(Lz), Z = $.padEnd(4, " "), K = Z.toLowerCase();
+function Lz($) {
+  let Q = new Set(Az), Z = $.padEnd(4, " "), K = Z.toLowerCase();
   if (LW(Z))
     for (let q of AW())
       Q.add(q);
@@ -47346,32 +47356,32 @@ function Fz($) {
       Q.add(q);
   return [...Q];
 }
-function Dz($, Q, Z, K, q) {
+function Fz($, Q, Z, K, q) {
   if (K.length === 0 && q === null)
     return Q === null ? `${$}||${Z}||` : `${$}|${Q}|${Z}||`;
   let J = K.map((W) => `${h9(W.tag)}:${W.enabled ? "1" : "0"}`).sort().join(","), U = q ? q.map((W) => W.toFixed(4)).join(",") : "";
   return `${$}|${Q || ""}|${Z}|${J}|${U}`;
 }
 function L5($, Q, Z, K, q = [], J = null) {
-  let U = Dz(Q, Z, K, q, J), W = BW.get($);
+  let U = Fz(Q, Z, K, q, J), W = BW.get($);
   if (!W)
     W = new Map, BW.set($, W);
   let H = W.get(U);
   if (H)
     return H;
-  let _ = Rz($, Q, Z, K, q, J);
-  if (W.size >= Az) {
+  let _ = Bz($, Q, Z, K, q, J);
+  if (W.size >= wz) {
     let N = W.keys().next().value;
     if (N !== undefined)
       W.delete(N);
   }
   return W.set(U, _), _;
 }
-function Bz($, Q, Z, K, q = [], J = null) {
+function Dz($, Q, Z, K, q = [], J = null) {
   return L5($, Q, Z, K, q, J);
 }
-function Rz($, Q, Z, K, q = [], J = null) {
-  let U = C(Q.padEnd(4, " ")), W = Z ? C(Z.padEnd(4, " ")) : null, H = new Set, _ = Fz(Q);
+function Bz($, Q, Z, K, q = [], J = null) {
+  let U = C(Q.padEnd(4, " ")), W = Z ? C(Z.padEnd(4, " ")) : null, H = new Set, _ = Lz(Q);
   for (let G = 0;G < _.length; G++)
     H.add(C(_[G]));
   for (let G = 0;G < RW.length; G++)
@@ -47446,19 +47456,19 @@ function MW($, Q, Z, K, q) {
 function $Q($) {
   return $ >= 44032 && $ <= 55203;
 }
-function Mz($) {
+function Rz($) {
   return $ >= 4352 && $ <= 4607 || $ >= 43360 && $ <= 43388 || $ >= 55216 && $ <= 55291;
 }
-function Tz($) {
+function Mz($) {
   return $ >= 4352 && $ < 4371 || $ >= 43360 && $ <= 43388;
 }
-function Oz($) {
+function Tz($) {
   return $ >= 4449 && $ < 4470 || $ >= 55216 && $ <= 55238;
 }
-function Pz($) {
+function Oz($) {
   return $ > 4519 && $ <= 4546 || $ >= 55243 && $ <= 55291;
 }
-function Iz($) {
+function Pz($) {
   if (!$Q($))
     return [$];
   let Q = $ - 44032, Z = Math.floor(Q / 588), K = Math.floor(Q % 588 / 28), q = Q % 28, J = [4352 + Z, 4449 + K];
@@ -47477,11 +47487,11 @@ function TW($, Q, Z = 0) {
   return 44032 + K * 588 + q * 28 + J;
 }
 function G0($) {
-  if (Tz($))
+  if (Mz($))
     return 1;
-  if (Oz($))
+  if (Tz($))
     return 2;
-  if (Pz($))
+  if (Oz($))
     return 3;
   if ($Q($))
     return ($ - 44032) % 28 === 0 ? 4 : 5;
@@ -47545,7 +47555,7 @@ function ZQ($) {
         continue;
       }
       if (G0(J.codepoint) === 3) {
-        let W = Iz(K.codepoint), [H, _] = W;
+        let W = Pz(K.codepoint), [H, _] = W;
         if (W.length === 2 && H !== undefined && _ !== undefined) {
           let N = TW(H, _, J.codepoint);
           if (N !== null) {
@@ -47560,12 +47570,12 @@ function ZQ($) {
   return Q;
 }
 function OW($) {
-  return $Q($) || Mz($) || $ >= 12593 && $ <= 12686;
+  return $Q($) || Rz($) || $ >= 12593 && $ <= 12686;
 }
-function vz($) {
+function Iz($) {
   return $ >= 1424 && $ <= 1535 || $ >= 64285 && $ <= 64335;
 }
-function kz($) {
+function vz($) {
   if ($ >= 1425 && $ <= 1455)
     return 6;
   if ($ >= 1456 && $ <= 1469)
@@ -47588,7 +47598,7 @@ function kz($) {
     return 1;
   if ($ >= 64285 && $ <= 64335)
     return 1;
-  if (vz($))
+  if (Iz($))
     return 0;
   return 0;
 }
@@ -47598,7 +47608,7 @@ function KQ($) {
     let K = $[Z];
     if (!K)
       continue;
-    if (kz(K.codepoint) === 1)
+    if (vz(K.codepoint) === 1)
       Q = Z;
     K.mask = K.mask & 4294901760 | Q & 65535;
   }
@@ -47704,12 +47714,12 @@ function gW($) {
     return Q;
   let K = 0;
   while (K < Z) {
-    let q = Cz($, K);
+    let q = kz($, K);
     Q.push(q), K = q.end;
   }
   return Q;
 }
-function Cz($, Q) {
+function kz($, Q) {
   let Z = $.length, K = Q, q = -1, J = false;
   if (K + 1 < Z) {
     let W = $[K], H = $[K + 1];
@@ -47900,10 +47910,10 @@ function JQ($) {
   let Q = gW($);
   for (let Z = 0;Z < Q.length; Z++) {
     let K = Q[Z];
-    Sz($, K);
+    Cz($, K);
   }
 }
-function Sz($, Q) {
+function Cz($, Q) {
   let { start: Z, end: K, baseConsonant: q, hasReph: J } = Q, U = [];
   for (let W = q + 1;W < K; W++) {
     let H = $[W];
@@ -48520,12 +48530,12 @@ function dW($) {
     return Q;
   let K = 0;
   while (K < Z) {
-    let q = hz($, K);
+    let q = Sz($, K);
     Q.push(q), K = q.end;
   }
   return Q;
 }
-function hz($, Q) {
+function Sz($, Q) {
   let Z = $.length, K = Q, q = -1, J = false;
   if (K + 1 < Z) {
     let U = $[K], W = $[K + 1];
@@ -48683,10 +48693,10 @@ function pW($) {
   let Q = dW($);
   for (let Z = 0;Z < Q.length; Z++) {
     let K = Q[Z];
-    yz($, K);
+    hz($, K);
   }
 }
-function yz($, Q) {
+function hz($, Q) {
   let { start: Z, end: K, base: q, hasReph: J } = Q, U = [];
   for (let W = q + 1;W < K; W++) {
     let H = $[W];
@@ -48729,11 +48739,11 @@ function yz($, Q) {
 }
 var zQ = new Uint16Array(16);
 var GQ = new Uint16Array(16);
-function bz($) {
+function yz($) {
   return $ instanceof n8 ? $.font : $;
 }
 var cW = new WeakMap;
-function mz($) {
+function bz($) {
   if ($ instanceof n8)
     return $;
   let Q = cW.get($);
@@ -48771,7 +48781,7 @@ function oW($, Q) {
       K = q;
   return Z;
 }
-function gz($, Q) {
+function mz($, Q) {
   if (!Q.gdef)
     return false;
   let { infos: Z, length: K } = $;
@@ -48784,7 +48794,7 @@ function gz($, Q) {
   }
   return false;
 }
-function uz($, Q, Z) {
+function gz($, Q, Z) {
   let K = new Int16Array($.infos.length);
   K.fill(-1);
   let q = -1;
@@ -48800,15 +48810,15 @@ function uz($, Q, Z) {
   }
   return K;
 }
-var xz = [];
-function fz($, Q, Z = {}) {
-  let K = xz.pop();
+var uz = [];
+function xz($, Q, Z = {}) {
+  let K = uz.pop();
   if (!K)
     K = C8.withCapacity(64);
   return iW($, Q, K, Z), K;
 }
 function iW($, Q, Z, K = {}) {
-  let q = bz($), J = mz($), U = K.script ?? Q.script ?? "latn", W = K.language ?? Q.language ?? null, H = K.direction ?? "ltr", _ = K.features ?? [], N = true;
+  let q = yz($), J = bz($), U = K.script ?? Q.script ?? "latn", W = K.language ?? Q.language ?? null, H = K.direction ?? "ltr", _ = K.features ?? [], N = true;
   if (_.length) {
     let G = C("kern");
     for (let Y = 0;Y < _.length; Y++) {
@@ -48820,19 +48830,19 @@ function iW($, Q, Z, K = {}) {
     }
   }
   let V = J.normalizedCoords.length > 0 ? J.normalizedCoords : null, X = L5(q, U, W, H, _, V);
-  if (Z.reset(), Z.direction = Q.direction, Z.script = U, Z.language = W, Z.initFromCodepointsWithFont(Q.codepoints, Q.clusters, q), lz(Z, U), nz(q, Z, X), JG(J, Z), q.gpos !== null && X.gposLookups.length > 0)
-    UG(q, Z, X);
+  if (Z.reset(), Z.direction = Q.direction, Z.script = U, Z.language = W, Z.initFromCodepointsWithFont(Q.codepoints, Q.clusters, q), fz(Z, U), dz(q, Z, X), qG(J, Z), q.gpos !== null && X.gposLookups.length > 0)
+    JG(q, Z, X);
   else {
     if (N)
       i1(q, Z.infos, Z.positions);
     o1(q, Z.infos, Z.positions);
   }
   if (!q.gsub && q.morx)
-    BG(q, Z);
+    DG(q, Z);
   if (H === "rtl")
     Z.reverse();
 }
-function lz($, Q) {
+function fz($, Q) {
   if (Q === "arab" || Q === "syrc" || Q === "mand" || Q === "nko ") {
     t1($.infos);
     return;
@@ -48869,9 +48879,9 @@ function lz($, Q) {
     return;
   }
   if (Q === "Zyyy" || Q === "Zinh" || Q === "Zzzz")
-    dz($.infos);
+    lz($.infos);
 }
-function dz($) {
+function lz($) {
   if ($.length === 0)
     return;
   let Q = Math.min(10, $.length);
@@ -48914,7 +48924,7 @@ function dz($) {
     }
   }
 }
-function nz($, Q, Z) {
+function dz($, Q, Z) {
   let K = Z.gsubLookups, q = new V6, J = Q.infos;
   for (let U = 0;U < Q.length; U++)
     q.add(J[U].glyphId);
@@ -48923,7 +48933,7 @@ function nz($, Q, Z) {
     if (!q.mayIntersect(W.lookup.digest))
       continue;
     let H = Q.length;
-    if (pz($, Q, W.lookup, Z), Q.length !== H) {
+    if (nz($, Q, W.lookup, Z), Q.length !== H) {
       q = new V6;
       for (let _ = 0;_ < Q.length; _++)
         q.add(J[_].glyphId);
@@ -48931,32 +48941,32 @@ function nz($, Q, Z) {
   }
   Q.compact();
 }
-function pz($, Q, Z, K) {
+function nz($, Q, Z, K) {
   switch (Z.type) {
     case 1:
-      cz($, Q, Z);
+      pz($, Q, Z);
       break;
     case 2:
-      oz($, Q, Z);
+      cz($, Q, Z);
       break;
     case 3:
-      iz($, Q, Z);
+      oz($, Q, Z);
       break;
     case 4:
-      sz($, Q, Z);
+      iz($, Q, Z);
       break;
     case 5:
-      rz($, Q, Z, K);
+      sz($, Q, Z, K);
       break;
     case 6:
-      az($, Q, Z, K);
+      rz($, Q, Z, K);
       break;
     case 8:
-      tz($, Q, Z);
+      az($, Q, Z);
       break;
   }
 }
-function cz($, Q, Z) {
+function pz($, Q, Z) {
   let K = Q.infos, q = K.length, J = Z.digest;
   if (Z.flag === 0 || !$.gdef) {
     if (Z.subtables.length === 1) {
@@ -49008,7 +49018,7 @@ function cz($, Q, Z) {
       H.glyphId = _;
   }
 }
-function oz($, Q, Z) {
+function cz($, Q, Z) {
   let K = Z.digest, q = 0;
   while (q < Q.infos.length) {
     let J = Q.infos[q];
@@ -49047,7 +49057,7 @@ function oz($, Q, Z) {
       q++;
   }
 }
-function iz($, Q, Z) {
+function oz($, Q, Z) {
   let K = Q.infos, q = Z.subtables, J = Z.digest;
   for (let U = 0;U < K.length; U++) {
     let W = K[U];
@@ -49070,7 +49080,7 @@ function iz($, Q, Z) {
     }
   }
 }
-function sz($, Q, Z) {
+function iz($, Q, Z) {
   let K = Q.infos, q = K.length, J = Z.flag !== 0 && $.gdef !== null, U = Z.digest, W = null;
   if (J)
     W = j8($, Q, Z.flag);
@@ -49121,6 +49131,40 @@ function sz($, Q, Z) {
     H++;
   }
 }
+function sz($, Q, Z, K) {
+  let q = Q.infos, J = q.length, U = Z.digest, W = null;
+  if (Z.flag !== 0 && $.gdef !== null)
+    W = j8($, Q, Z.flag);
+  let H = Z.subtables;
+  for (let _ = 0;_ < J; _++) {
+    let N = q[_];
+    if (!N)
+      continue;
+    if (W?.[_])
+      continue;
+    if (!U.mayHave(N.glyphId))
+      continue;
+    for (let V = 0;V < H.length; V++) {
+      let X = H[V], z = false, G = [];
+      if (X.format === 1) {
+        let Y = tz($, Q, _, X, Z.flag);
+        if (Y)
+          z = true, G = Y;
+      } else if (X.format === 2) {
+        let Y = ez($, Q, _, X, Z.flag);
+        if (Y)
+          z = true, G = Y;
+      } else if (X.format === 3) {
+        if ($G($, Q, _, X, Z.flag))
+          z = true, G = X.lookupRecords;
+      }
+      if (z) {
+        sW($, Q, _, G, K);
+        break;
+      }
+    }
+  }
+}
 function rz($, Q, Z, K) {
   let q = Q.infos, J = q.length, U = Z.digest, W = null;
   if (Z.flag !== 0 && $.gdef !== null)
@@ -49137,49 +49181,15 @@ function rz($, Q, Z, K) {
     for (let V = 0;V < H.length; V++) {
       let X = H[V], z = false, G = [];
       if (X.format === 1) {
-        let Y = ez($, Q, _, X, Z.flag);
+        let Y = QG($, Q, _, X, Z.flag);
         if (Y)
           z = true, G = Y;
       } else if (X.format === 2) {
-        let Y = $G($, Q, _, X, Z.flag);
-        if (Y)
-          z = true, G = Y;
-      } else if (X.format === 3) {
-        if (QG($, Q, _, X, Z.flag))
-          z = true, G = X.lookupRecords;
-      }
-      if (z) {
-        sW($, Q, _, G, K);
-        break;
-      }
-    }
-  }
-}
-function az($, Q, Z, K) {
-  let q = Q.infos, J = q.length, U = Z.digest, W = null;
-  if (Z.flag !== 0 && $.gdef !== null)
-    W = j8($, Q, Z.flag);
-  let H = Z.subtables;
-  for (let _ = 0;_ < J; _++) {
-    let N = q[_];
-    if (!N)
-      continue;
-    if (W?.[_])
-      continue;
-    if (!U.mayHave(N.glyphId))
-      continue;
-    for (let V = 0;V < H.length; V++) {
-      let X = H[V], z = false, G = [];
-      if (X.format === 1) {
         let Y = ZG($, Q, _, X, Z.flag);
         if (Y)
           z = true, G = Y;
-      } else if (X.format === 2) {
-        let Y = KG($, Q, _, X, Z.flag);
-        if (Y)
-          z = true, G = Y;
       } else if (X.format === 3) {
-        if (qG($, Q, _, X, Z.flag))
+        if (KG($, Q, _, X, Z.flag))
           z = true, G = X.lookupRecords;
       }
       if (z) {
@@ -49189,7 +49199,7 @@ function az($, Q, Z, K) {
     }
   }
 }
-function tz($, Q, Z) {
+function az($, Q, Z) {
   let K = Q.infos, q = Z.subtables, J = Z.digest;
   for (let U = K.length - 1;U >= 0; U--) {
     let W = K[U];
@@ -49236,7 +49246,7 @@ function tz($, Q, Z) {
     }
   }
 }
-function ez($, Q, Z, K, q) {
+function tz($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId, U = K.coverage.get(J);
   if (U === null)
     return null;
@@ -49250,7 +49260,7 @@ function ez($, Q, Z, K, q) {
   }
   return null;
 }
-function $G($, Q, Z, K, q) {
+function ez($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId;
   if (K.coverage.get(J) === null)
     return null;
@@ -49264,7 +49274,7 @@ function $G($, Q, Z, K, q) {
   }
   return null;
 }
-function QG($, Q, Z, K, q) {
+function $G($, Q, Z, K, q) {
   let J = Q.infos, U = K.coverages, W = Z;
   for (let H = 0;H < U.length; H++) {
     let _ = U[H];
@@ -49278,7 +49288,7 @@ function QG($, Q, Z, K, q) {
   }
   return true;
 }
-function ZG($, Q, Z, K, q) {
+function QG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId, U = K.coverage.get(J);
   if (U === null)
     return null;
@@ -49303,7 +49313,7 @@ function ZG($, Q, Z, K, q) {
   }
   return null;
 }
-function KG($, Q, Z, K, q) {
+function ZG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId;
   if (K.coverage.get(J) === null)
     return null;
@@ -49328,7 +49338,7 @@ function KG($, Q, Z, K, q) {
   }
   return null;
 }
-function qG($, Q, Z, K, q) {
+function KG($, Q, Z, K, q) {
   let J = Q.infos, U = Z - 1, W = K.backtrackCoverages;
   for (let X = 0;X < W.length; X++) {
     let z = W[X];
@@ -49414,7 +49424,7 @@ function sW($, Q, Z, K, q) {
     }
   }
 }
-function JG($, Q) {
+function qG($, Q) {
   let { infos: Z, positions: K } = Q, q = Z.length, U = $.font.hmtx.hMetrics, W = U.length, H = U[W - 1]?.advanceWidth ?? 0;
   if (!($.normalizedCoords.length > 0)) {
     for (let N = 0;N < q; N++) {
@@ -49434,15 +49444,15 @@ function o8($, Q, Z) {
     K = z8($.gdef, Q), Z.set(Q, K);
   return K;
 }
-function UG($, Q, Z) {
+function JG($, Q, Z) {
   let K = new V6, q = Q.infos, J = Q.length;
   for (let N = 0;N < J; N++)
     K.add(q[N].glyphId);
-  let U = gz(Q, $), W, H;
+  let U = mz(Q, $), W, H;
   if (U)
-    H = new Map, W = uz(Q, H, $);
+    H = new Map, W = gz(Q, H, $);
   else
-    W = WG, H = HG;
+    W = UG, H = WG;
   let _ = Z.gposLookups;
   for (let N = 0;N < _.length; N++) {
     let V = _[N];
@@ -49451,43 +49461,43 @@ function UG($, Q, Z) {
     YQ($, Q, V.lookup, Z, H, W, U);
   }
 }
-var WG = new Int16Array(0);
-var HG = new Map;
+var UG = new Int16Array(0);
+var WG = new Map;
 function YQ($, Q, Z, K, q, J, U) {
   switch (Z.type) {
     case 1:
-      _G($, Q, Z, U);
+      HG($, Q, Z, U);
       break;
     case 2:
-      NG($, Q, Z, U);
+      _G($, Q, Z, U);
       break;
     case 3:
-      VG($, Q, Z, U);
+      NG($, Q, Z, U);
       break;
     case 4:
       if (!U)
         break;
-      XG($, Q, Z, q, J);
+      VG($, Q, Z, q, J);
       break;
     case 5:
       if (!U)
         break;
-      zG($, Q, Z, q, J);
+      XG($, Q, Z, q, J);
       break;
     case 6:
       if (!U)
         break;
-      GG($, Q, Z, q);
+      zG($, Q, Z, q);
       break;
     case 7:
-      YG($, Q, Z, K, q, J, U);
+      GG($, Q, Z, K, q, J, U);
       break;
     case 8:
-      jG($, Q, Z, K, q, J, U);
+      YG($, Q, Z, K, q, J, U);
       break;
   }
 }
-function _G($, Q, Z, K) {
+function HG($, Q, Z, K) {
   let { infos: q, positions: J } = Q, U = q.length, W = Z.digest, H = Z.subtables, _ = K && Z.flag !== 0 && $.gdef !== null;
   if (H.length === 1 && !_) {
     let X = H[0];
@@ -49551,7 +49561,7 @@ function _G($, Q, Z, K) {
     N(X);
   }
 }
-function NG($, Q, Z, K) {
+function _G($, Q, Z, K) {
   let { infos: q, positions: J } = Q, U = q.length, W = Z.digest, H = Z.subtables, _ = H.length;
   if (!(K && Z.flag !== 0 && $.gdef !== null)) {
     if (_ === 1) {
@@ -49673,7 +49683,7 @@ function NG($, Q, Z, K) {
     R1(Z, Y.glyphId, j.glyphId, E, w);
   }
 }
-function VG($, Q, Z, K) {
+function NG($, Q, Z, K) {
   let { infos: q, positions: J } = Q, U = q.length, W = Z.digest, H = Z.subtables, _ = (z, G) => {
     let Y = q[z], j = q[G];
     if (!W.mayHave(Y.glyphId) && !W.mayHave(j.glyphId))
@@ -49706,7 +49716,7 @@ function VG($, Q, Z, K) {
     _(z, G);
   }
 }
-function XG($, Q, Z, K, q) {
+function VG($, Q, Z, K, q) {
   let J = Z.digest, U = Q.infos, W = Q.positions, H = Z.subtables;
   for (let _ = 0;_ < U.length; _++) {
     let N = U[_];
@@ -49740,7 +49750,7 @@ function XG($, Q, Z, K, q) {
     }
   }
 }
-function zG($, Q, Z, K, q) {
+function XG($, Q, Z, K, q) {
   let J = Z.digest, U = Q.infos, W = Q.positions, H = Z.subtables;
   for (let _ = 0;_ < U.length; _++) {
     let N = U[_];
@@ -49785,7 +49795,7 @@ function zG($, Q, Z, K, q) {
     }
   }
 }
-function GG($, Q, Z, K) {
+function zG($, Q, Z, K) {
   let q = Z.digest, J = Q.infos, U = Q.positions, W = Z.subtables;
   for (let H = 0;H < J.length; H++) {
     let _ = J[H];
@@ -49826,6 +49836,39 @@ function GG($, Q, Z, K) {
     }
   }
 }
+function GG($, Q, Z, K, q, J, U) {
+  let W = Q.infos, H = W.length, _ = Z.digest, N = Z.subtables, V = null;
+  if (Z.flag !== 0 && $.gdef !== null)
+    V = j8($, Q, Z.flag);
+  for (let X = 0;X < H; X++) {
+    let z = W[X];
+    if (!z)
+      continue;
+    if (V?.[X])
+      continue;
+    if (!_.mayHave(z.glyphId))
+      continue;
+    for (let G = 0;G < N.length; G++) {
+      let Y = N[G], j = false, E = [];
+      if (Y.format === 1) {
+        let w = jG($, Q, X, Y, Z.flag);
+        if (w)
+          j = true, E = w;
+      } else if (Y.format === 2) {
+        let w = EG($, Q, X, Y, Z.flag);
+        if (w)
+          j = true, E = w;
+      } else if (Y.format === 3) {
+        if (wG($, Q, X, Y, Z.flag))
+          j = true, E = Y.lookupRecords;
+      }
+      if (j) {
+        rW($, Q, X, E, K, q, J, U);
+        break;
+      }
+    }
+  }
+}
 function YG($, Q, Z, K, q, J, U) {
   let W = Q.infos, H = W.length, _ = Z.digest, N = Z.subtables, V = null;
   if (Z.flag !== 0 && $.gdef !== null)
@@ -49841,48 +49884,15 @@ function YG($, Q, Z, K, q, J, U) {
     for (let G = 0;G < N.length; G++) {
       let Y = N[G], j = false, E = [];
       if (Y.format === 1) {
-        let w = EG($, Q, X, Y, Z.flag);
+        let w = AG($, Q, X, Y, Z.flag);
         if (w)
           j = true, E = w;
       } else if (Y.format === 2) {
-        let w = wG($, Q, X, Y, Z.flag);
-        if (w)
-          j = true, E = w;
-      } else if (Y.format === 3) {
-        if (AG($, Q, X, Y, Z.flag))
-          j = true, E = Y.lookupRecords;
-      }
-      if (j) {
-        rW($, Q, X, E, K, q, J, U);
-        break;
-      }
-    }
-  }
-}
-function jG($, Q, Z, K, q, J, U) {
-  let W = Q.infos, H = W.length, _ = Z.digest, N = Z.subtables, V = null;
-  if (Z.flag !== 0 && $.gdef !== null)
-    V = j8($, Q, Z.flag);
-  for (let X = 0;X < H; X++) {
-    let z = W[X];
-    if (!z)
-      continue;
-    if (V?.[X])
-      continue;
-    if (!_.mayHave(z.glyphId))
-      continue;
-    for (let G = 0;G < N.length; G++) {
-      let Y = N[G], j = false, E = [];
-      if (Y.format === 1) {
         let w = LG($, Q, X, Y, Z.flag);
         if (w)
           j = true, E = w;
-      } else if (Y.format === 2) {
-        let w = FG($, Q, X, Y, Z.flag);
-        if (w)
-          j = true, E = w;
       } else if (Y.format === 3) {
-        if (DG($, Q, X, Y, Z.flag))
+        if (FG($, Q, X, Y, Z.flag))
           j = true, E = Y.lookupRecords;
       }
       if (j) {
@@ -49892,7 +49902,7 @@ function jG($, Q, Z, K, q, J, U) {
     }
   }
 }
-function EG($, Q, Z, K, q) {
+function jG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId, U = K.coverage.get(J);
   if (U === null)
     return null;
@@ -49906,7 +49916,7 @@ function EG($, Q, Z, K, q) {
   }
   return null;
 }
-function wG($, Q, Z, K, q) {
+function EG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId;
   if (K.coverage.get(J) === null)
     return null;
@@ -49920,7 +49930,7 @@ function wG($, Q, Z, K, q) {
   }
   return null;
 }
-function AG($, Q, Z, K, q) {
+function wG($, Q, Z, K, q) {
   let J = Q.infos, U = K.coverages, W = Z;
   for (let H = 0;H < U.length; H++) {
     let _ = U[H];
@@ -49934,7 +49944,7 @@ function AG($, Q, Z, K, q) {
   }
   return true;
 }
-function LG($, Q, Z, K, q) {
+function AG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId, U = K.coverage.get(J);
   if (U === null)
     return null;
@@ -49959,7 +49969,7 @@ function LG($, Q, Z, K, q) {
   }
   return null;
 }
-function FG($, Q, Z, K, q) {
+function LG($, Q, Z, K, q) {
   let J = Q.infos[Z]?.glyphId;
   if (K.coverage.get(J) === null)
     return null;
@@ -49984,7 +49994,7 @@ function FG($, Q, Z, K, q) {
   }
   return null;
 }
-function DG($, Q, Z, K, q) {
+function FG($, Q, Z, K, q) {
   let J = Q.infos, U = Z - 1, W = K.backtrackCoverages;
   for (let X = 0;X < W.length; X++) {
     let z = W[X];
@@ -50130,7 +50140,7 @@ function Y6($, Q, Z) {
   }
   return false;
 }
-function BG($, Q) {
+function DG($, Q) {
   let Z = $.morx;
   if (!Z)
     return;
@@ -50232,7 +50242,7 @@ var k6 = H6("B") | H6("S") | H6("WS") | H6("ON") | H6("FSI") | H6("LRI") | H6("R
 var L6 = H6("BN") | H6("RLE") | H6("LRE") | H6("RLO") | H6("LRO") | H6("PDF");
 var E0 = H6("S") | H6("WS") | H6("B") | q8 | H6("PDI") | L6;
 var T5 = null;
-function RG() {
+function BG() {
   if (!T5) {
     T5 = new Map;
     let $ = 0;
@@ -50261,7 +50271,7 @@ function RG() {
   }
 }
 function m6($) {
-  RG();
+  BG();
   let Q = $.codePointAt(0);
   if (Q === undefined)
     return H6("L");
@@ -50275,9 +50285,9 @@ var P5 = J6.ET ?? 16;
 var A0 = J6.AN ?? 32;
 var I5 = J6.CS ?? 64;
 var T9 = J6.B ?? 128;
-var MG = J6.S ?? 256;
+var RG = J6.S ?? 256;
 var v5 = J6.ON ?? 512;
-var TG = J6.BN ?? 1024;
+var MG = J6.BN ?? 1024;
 var k5 = J6.NSM ?? 2048;
 var C5 = J6.AL ?? 4096;
 var QH = J6.LRO ?? 8192;
@@ -50285,9 +50295,9 @@ var S5 = J6.RLO ?? 16384;
 var ZH = J6.LRE ?? 32768;
 var LQ = J6.RLE ?? 65536;
 var KH = J6.PDF ?? 131072;
-var OG = J6.LRI ?? 262144;
+var TG = J6.LRI ?? 262144;
 var qH = J6.RLI ?? 524288;
-var PG = J6.FSI ?? 1048576;
+var OG = J6.FSI ?? 1048576;
 var O9 = J6.PDI ?? 2097152;
 function a($, Q) {
   return $[Q] ?? 0;
@@ -50375,8 +50385,8 @@ function FQ($, Q) {
           else if (!w)
             L++;
         } else if (P & q8) {
-          if (P & PG)
-            P = N(R + 1, true) === 1 ? qH : OG;
+          if (P & OG)
+            P = N(R + 1, true) === 1 ? qH : TG;
           if (U[R] = T._level, T._override)
             J(R, T._override);
           let m = (P === qH ? G : z)(T._level);
@@ -50415,7 +50425,7 @@ function FQ($, Q) {
           U[R] = T._level;
         } else if (P & T9)
           U[R] = _.level;
-      } else if (U[R] = T._level, T._override && P !== TG)
+      } else if (U[R] = T._level, T._override && P !== MG)
         J(R, T._override);
     }
     let D = [], F = null;
@@ -50442,8 +50452,8 @@ function FQ($, Q) {
           if (S == null)
             break;
           let d = false;
-          for (let c = R + 1;c < D.length; c++) {
-            let n = D[c];
+          for (let o = R + 1;o < D.length; o++) {
+            let n = D[o];
             if (n?._start === S) {
               F = n, T.push(n), d = true;
               break;
@@ -50455,8 +50465,8 @@ function FQ($, Q) {
         let m = [];
         for (let S = 0;S < T.length; S++) {
           let d = T[S];
-          for (let c = d._start;c <= d._end; c++)
-            m.push(c);
+          for (let o = d._start;o <= d._end; o++)
+            m.push(o);
         }
         let v = m[0] ?? 0, f = U[v] ?? 0, l = _.level;
         for (let S = v - 1;S >= 0; S--)
@@ -50578,9 +50588,9 @@ function FQ($, Q) {
       if (q.get(k6)) {
         let k = p6 | C6 | A0, O = k | f6, h = [], S = [];
         for (let d = 0;d < T.length; d++) {
-          let c = _6(T, d);
-          if (a(K, c) & k6) {
-            let n = P9($, c);
+          let o = _6(T, d);
+          if (a(K, o) & k6) {
+            let n = P9($, o);
             if (B5(n) !== null)
               if (S.length < 63)
                 S.push({ char: n, seqIndex: d });
@@ -50602,9 +50612,9 @@ function FQ($, Q) {
             }
           }
         }
-        h.sort((d, c) => d[0] - c[0]);
+        h.sort((d, o) => d[0] - o[0]);
         for (let d = 0;d < h.length; d++) {
-          let c = h[d], [n, e] = c, u = false, N6 = 0;
+          let o = h[d], [n, e] = o, u = false, N6 = 0;
           for (let y = n + 1;y < e; y++) {
             let t = _6(T, y), g = a(K, t);
             if (g & O) {
@@ -50649,8 +50659,8 @@ function FQ($, Q) {
           }
         }
         for (let d = 0;d < T.length; d++) {
-          let c = _6(T, d);
-          if (a(K, c) & k6) {
+          let o = _6(T, d);
+          if (a(K, o) & k6) {
             let n = d, e = d, u = m;
             for (let y = d - 1;y >= 0; y--) {
               let t = _6(T, y);
@@ -50689,7 +50699,7 @@ function FQ($, Q) {
         U[R] += 2;
       if (T & L6)
         U[R] = R === 0 ? _.level : U[R - 1] ?? _.level;
-      if (R === _.end || m6(P9($, R)) & (MG | T9))
+      if (R === _.end || m6(P9($, R)) & (RG | T9))
         for (let m = R;m >= 0 && m6(P9($, m)) & E0; m--)
           U[m] = _.level;
     }
@@ -50698,7 +50708,7 @@ function FQ($, Q) {
 }
 var JH = "14>1,j>2,t>2,u>2,1a>g,2v3>1,1>1,1ge>1,1wd>1,b>1,1j>1,f>1,ai>3,-2>3,+1,8>1k0,-1jq>1y7,-1y6>1hf,-1he>1h6,-1h5>1ha,-1h8>1qi,-1pu>1,6>3u,-3s>7,6>1,1>1,f>1,1>1,+2,3>1,1>1,+13,4>1,1>1,6>1eo,-1ee>1,3>1mg,-1me>1mk,-1mj>1mi,-1mg>1mi,-1md>1,1>1,+2,1>10k,-103>1,1>1,4>1,5>1,1>1,+10,3>1,1>8,-7>8,+1,-6>7,+1,a>1,1>1,u>1,u6>1,1>1,+5,26>1,1>1,2>1,2>2,8>1,7>1,4>1,1>1,+5,b8>1,1>1,+3,1>3,-2>1,2>1,1>1,+2,c>1,3>1,1>1,+2,h>1,3>1,a>1,1>1,2>1,3>1,1>1,d>1,f>1,3>1,1a>1,1>1,6>1,7>1,13>1,k>1,1>1,+19,4>1,1>1,+2,2>1,1>1,+18,m>1,a>1,1>1,lk>1,1>1,4>1,2>1,f>1,3>1,1>1,+3,db>1,1>1,+3,3>1,1>1,+2,14qm>1,1>1,+1,6>1,4j>1,j>2,t>2,u>2,2>1,+1";
 var DQ = null;
-function IG() {
+function PG() {
   if (!DQ) {
     let { map: $, reverseMap: Q } = Y0(JH, true);
     if (Q)
@@ -50709,7 +50719,7 @@ function IG() {
   }
 }
 function h5($) {
-  return IG(), DQ?.get($) || null;
+  return PG(), DQ?.get($) || null;
 }
 function UH($, Q, Z, K) {
   let q = $.length, J = Math.max(0, Z == null ? 0 : +Z), U = Math.min(q - 1, K == null ? q - 1 : +K), W = [];
@@ -50767,7 +50777,7 @@ function WH($, Q = 4) {
   let Z = Q === 5 ? "rtl" : Q === 4 ? "ltr" : "auto", K = FQ($, Z);
   return { levels: K.levels, paragraphs: K.paragraphs };
 }
-function vG($, Q, Z = 0, K = $.length) {
+function IG($, Q, Z = 0, K = $.length) {
   return [...y5($, Q, Z, K)];
 }
 function HH($, Q) {
@@ -50801,18 +50811,18 @@ function NH($, Q) {
   }
 }
 var i8 = { L: 1, R: 2, EN: 4, ES: 8, ET: 16, AN: 32, CS: 64, B: 128, S: 256, WS: 512, ON: 1024, BN: 2048, NSM: 4096, AL: 8192, LRO: 16384, RLO: 32768, LRE: 65536, RLE: 131072, PDF: 262144, LRI: 524288, RLI: 1048576, FSI: 2097152, PDI: 4194304 };
-function kG($) {
+function vG($) {
   return m6($);
 }
-function CG($) {
+function kG($) {
   let Q = String.fromCodePoint($);
   return (m6(Q) & (i8.R | i8.AL)) !== 0;
 }
-function SG($) {
+function CG($) {
   let Q = String.fromCodePoint($);
   return (m6(Q) & i8.L) !== 0;
 }
-function hG($) {
+function SG($) {
   let Q = [...$];
   for (let Z = 0;Z < Q.length; Z++) {
     let K = Q[Z], q = m6(K);
@@ -50823,7 +50833,7 @@ function hG($) {
   }
   return 4;
 }
-function yG($, Q = 4) {
+function hG($, Q = 4) {
   if ($.length === 0)
     return { infos: $, levels: new Uint8Array(0) };
   let Z = $.map((J) => String.fromCodePoint(J.codepoint)).join(""), K = WH(Z, Q);
@@ -51566,7 +51576,7 @@ function GH($) {
     return 29;
   return 42;
 }
-function bG($, Q) {
+function yG($, Q) {
   if ($ === 28)
     $ = 29;
   if ($ === 41)
@@ -51694,7 +51704,7 @@ function bG($, Q) {
     return 4;
   return 0;
 }
-function mG($) {
+function bG($) {
   let Q = [], Z = [...$];
   for (let K = 0;K < Z.length; K++) {
     let q = Z[K];
@@ -51711,7 +51721,7 @@ function BQ($) {
   K.push(0);
   for (let q = 1;q < Q; q++) {
     let J = Z[q - 1], U = Z[q];
-    switch (bG(J, U)) {
+    switch (yG(J, U)) {
       case 5:
         K.push(2);
         break;
@@ -51724,27 +51734,27 @@ function BQ($) {
   }
   return K.push(2), { breaks: K, classes: Z };
 }
-function gG($) {
+function mG($) {
   let Q = $.map((Z) => Z.codepoint);
   return BQ(Q);
 }
-function uG($, Q) {
+function gG($, Q) {
   for (let Z = Q + 1;Z < $.breaks.length; Z++)
     if ($.breaks[Z] !== 0)
       return Z;
   return $.breaks.length - 1;
 }
-function xG($, Q) {
+function uG($, Q) {
   if (Q < 0 || Q >= $.breaks.length)
     return false;
   return $.breaks[Q] !== 0;
 }
-function fG($, Q) {
+function xG($, Q) {
   if (Q < 0 || Q >= $.breaks.length)
     return false;
   return $.breaks[Q] === 2;
 }
-function lG($) {
+function fG($) {
   let Q = [];
   for (let Z = 0;Z < $.breaks.length; Z++)
     if ($.breaks[Z] !== 0)
@@ -51932,7 +51942,7 @@ function L0($) {
   }
   return "Zzzz";
 }
-function dG($) {
+function lG($) {
   let Q = new Map, Z = [...$];
   for (let U = 0;U < Z.length; U++) {
     let H = Z[U].codePointAt(0) ?? 0, _ = L0(H);
@@ -51950,7 +51960,7 @@ function dG($) {
   }
   return K;
 }
-function nG($) {
+function dG($) {
   let Q = new Set, Z = [...$];
   for (let K = 0;K < Z.length; K++) {
     let J = Z[K].codePointAt(0) ?? 0, U = L0(J);
@@ -51958,7 +51968,7 @@ function nG($) {
   }
   return [...Q];
 }
-function pG($, Q) {
+function nG($, Q) {
   let Z = [...$];
   for (let K = 0;K < Z.length; K++) {
     let J = Z[K].codePointAt(0) ?? 0, U = L0(J);
@@ -51967,7 +51977,7 @@ function pG($, Q) {
   }
   return true;
 }
-function cG($) {
+function pG($) {
   let Q = [];
   if ($.length === 0)
     return Q;
@@ -51987,16 +51997,16 @@ function cG($) {
     Q.push({ script: Z, start: K, end: J.length, text: J.slice(K).join("") });
   return Q;
 }
-function oG($) {
+function cG($) {
   return { ["Zyyy"]: "DFLT", ["Zinh"]: "DFLT", ["Zzzz"]: "DFLT", ["Latn"]: "latn", ["Grek"]: "grek", ["Cyrl"]: "cyrl", ["Armn"]: "armn", ["Hebr"]: "hebr", ["Arab"]: "arab", ["Syrc"]: "syrc", ["Thaa"]: "thaa", ["Deva"]: "deva", ["Beng"]: "beng", ["Guru"]: "guru", ["Gujr"]: "gujr", ["Orya"]: "orya", ["Taml"]: "taml", ["Telu"]: "telu", ["Knda"]: "knda", ["Mlym"]: "mlym", ["Sinh"]: "sinh", ["Thai"]: "thai", ["Laoo"]: "lao ", ["Tibt"]: "tibt", ["Mymr"]: "mymr", ["Geor"]: "geor", ["Hang"]: "hang", ["Ethi"]: "ethi", ["Cher"]: "cher", ["Cans"]: "cans", ["Ogam"]: "ogam", ["Runr"]: "runr", ["Khmr"]: "khmr", ["Mong"]: "mong", ["Hira"]: "kana", ["Kana"]: "kana", ["Bopo"]: "bopo", ["Hani"]: "hani", ["Yiii"]: "yi  ", ["Ital"]: "ital", ["Goth"]: "goth", ["Dsrt"]: "dsrt", ["Tglg"]: "tglg", ["Hano"]: "hano", ["Buhd"]: "buhd", ["Tagb"]: "tagb", ["Limb"]: "limb", ["Tale"]: "tale", ["Linb"]: "linb", ["Ugar"]: "ugar", ["Shaw"]: "shaw", ["Osma"]: "osma", ["Cprt"]: "cprt", ["Brai"]: "brai", ["Bugi"]: "bugi", ["Copt"]: "copt", ["Talu"]: "talu", ["Glag"]: "glag", ["Tfng"]: "tfng", ["Sylo"]: "sylo", ["Xpeo"]: "xpeo", ["Khar"]: "khar", ["Bali"]: "bali", ["Xsux"]: "xsux", ["Phnx"]: "phnx", ["Phag"]: "phag", ["Nkoo"]: "nko ", ["Sund"]: "sund", ["Lepc"]: "lepc", ["Olck"]: "olck", ["Vaii"]: "vai ", ["Saur"]: "saur", ["Kali"]: "kali", ["Rjng"]: "rjng", ["Lyci"]: "lyci", ["Cari"]: "cari", ["Lydi"]: "lydi", ["Cham"]: "cham", ["Lana"]: "lana", ["Tavt"]: "tavt", ["Avst"]: "avst", ["Egyp"]: "egyp", ["Samr"]: "samr", ["Lisu"]: "lisu", ["Bamu"]: "bamu", ["Java"]: "java", ["Mtei"]: "mtei", ["Armi"]: "armi", ["Sarb"]: "sarb", ["Prti"]: "prti", ["Phli"]: "phli", ["Orkh"]: "orkh", ["Kthi"]: "kthi", ["Batk"]: "batk", ["Brah"]: "brah", ["Mand"]: "mand", ["Cakm"]: "cakm", ["Merc"]: "merc", ["Mero"]: "mero", ["Plrd"]: "plrd", ["Shrd"]: "shrd", ["Sora"]: "sora", ["Takr"]: "takr", ["Aghb"]: "aghb", ["Bass"]: "bass", ["Dupl"]: "dupl", ["Elba"]: "elba", ["Gran"]: "gran", ["Hmng"]: "hmng", ["Khoj"]: "khoj", ["Lina"]: "lina", ["Mahj"]: "mahj", ["Mani"]: "mani", ["Mend"]: "mend", ["Modi"]: "modi", ["Mroo"]: "mroo", ["Narb"]: "narb", ["Nbat"]: "nbat", ["Palm"]: "palm", ["Pauc"]: "pauc", ["Perm"]: "perm", ["Phlp"]: "phlp", ["Sidd"]: "sidd", ["Sind"]: "sind", ["Tirh"]: "tirh", ["Wara"]: "wara", ["Ahom"]: "ahom", ["Hluw"]: "hluw", ["Hatr"]: "hatr", ["Mult"]: "mult", ["Hung"]: "hung", ["Sgnw"]: "sgnw", ["Adlm"]: "adlm", ["Bhks"]: "bhks", ["Marc"]: "marc", ["Newa"]: "newa", ["Osge"]: "osge", ["Tang"]: "tang", ["Gonm"]: "gonm", ["Nshu"]: "nshu", ["Soyo"]: "soyo", ["Zanb"]: "zanb", ["Dogr"]: "dogr", ["Gong"]: "gong", ["Maka"]: "maka", ["Medf"]: "medf", ["Rohg"]: "rohg", ["Sogd"]: "sogd", ["Sogo"]: "sogo", ["Elym"]: "elym", ["Nand"]: "nand", ["Hmnp"]: "hmnp", ["Wcho"]: "wcho", ["Yezi"]: "yezi", ["Chrs"]: "chrs", ["Diak"]: "diak", ["Kits"]: "kits", ["Vith"]: "vith", ["Ougr"]: "ougr", ["Cpmn"]: "cpmn", ["Tnsa"]: "tnsa", ["Toto"]: "toto", ["Kawi"]: "kawi", ["Nagm"]: "nagm" }[$] ?? "DFLT";
 }
-var iG = new Set(["Arab", "Syrc", "Hebr", "Thaa", "Nkoo", "Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai", "Laoo", "Tibt", "Mymr", "Khmr", "Mong", "Hang"]);
-var sG = new Set(["Arab", "Hebr", "Syrc", "Thaa", "Nkoo", "Samr", "Mand", "Armi", "Phnx", "Sarb", "Narb", "Avst", "Prti", "Phli", "Phlp", "Hatr", "Lydi", "Nbat", "Palm", "Mani", "Mend", "Rohg", "Yezi", "Sogo", "Sogd", "Elym", "Chrs", "Ougr", "Adlm"]);
-function rG($) {
-  return iG.has($);
+var oG = new Set(["Arab", "Syrc", "Hebr", "Thaa", "Nkoo", "Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai", "Laoo", "Tibt", "Mymr", "Khmr", "Mong", "Hang"]);
+var iG = new Set(["Arab", "Hebr", "Syrc", "Thaa", "Nkoo", "Samr", "Mand", "Armi", "Phnx", "Sarb", "Narb", "Avst", "Prti", "Phli", "Phlp", "Hatr", "Lydi", "Nbat", "Palm", "Mani", "Mend", "Rohg", "Yezi", "Sogo", "Sogd", "Elym", "Chrs", "Ougr", "Adlm"]);
+function sG($) {
+  return oG.has($);
 }
-function aG($) {
-  return sG.has($) ? "rtl" : "ltr";
+function rG($) {
+  return iG.has($) ? "rtl" : "ltr";
 }
 var EH;
 ((Y) => {
@@ -53044,7 +53054,7 @@ function LH($) {
   }
   return K.push(Q), { boundaries: K, properties: Z };
 }
-function tG($) {
+function aG($) {
   let Q = [], Z = [...$];
   for (let U = 0;U < Z.length; U++) {
     let W = Z[U];
@@ -53059,7 +53069,7 @@ function tG($) {
   }
   return q;
 }
-function eG($) {
+function tG($) {
   let Q = [], Z = [...$];
   for (let U = 0;U < Z.length; U++) {
     let W = Z[U];
@@ -53080,7 +53090,7 @@ function eG($) {
   }
   return J;
 }
-function $Y($) {
+function eG($) {
   let Q = [], Z = [...$];
   for (let q = 0;q < Z.length; q++) {
     let J = Z[q];
@@ -53101,8 +53111,7 @@ function openLink(uri) {
     const win = window.open(url.toString(), "_blank", "noopener,noreferrer");
     if (win)
       win.opener = null;
-  } catch {
-  }
+  } catch {}
 }
 function sourceLabelFromUrl(url, index) {
   const trimmed = url.trim();
@@ -53396,8 +53405,7 @@ async function tryLoadLocalFontBuffer(matchers, label) {
       const status = await queryPermission({ name: LOCAL_FONTS_PERMISSION_NAME });
       if (status?.state === "denied")
         return null;
-    } catch {
-    }
+    } catch {}
   }
   try {
     const fonts = await queryLocalFonts();
@@ -53464,8 +53472,7 @@ async function parseFontFacesFromBuffer(buffer) {
           metadataLabel: info.fullName || info.family || info.postScriptName || undefined,
           index: info.index
         });
-      } catch {
-      }
+      } catch {}
     }
     return parsed;
   }
@@ -53520,8 +53527,7 @@ function createResttyFontResourceStore(options = {}) {
         }
         return buffer;
       }
-    } catch {
-    }
+    } catch {}
     return await urlByteCache.getStale(sourceKey);
   };
   const defaultLoadSourceBuffer = async (source, sourceKey) => {
@@ -54079,13 +54085,13 @@ function normalizeFontSources(sources2, preset) {
 // src/runtime/pty-output-buffer.ts
 function concatBytes(chunks) {
   let total = 0;
-  for (const c of chunks)
-    total += c.length;
+  for (const c3 of chunks)
+    total += c3.length;
   const result = new Uint8Array(total);
   let offset = 0;
-  for (const c of chunks) {
-    result.set(c, offset);
-    offset += c.length;
+  for (const c3 of chunks) {
+    result.set(c3, offset);
+    offset += c3.length;
   }
   return result;
 }
@@ -55408,8 +55414,7 @@ function createShaderStageRuntime(options) {
     console.warn(text2);
     try {
       stage.onError?.(text2);
-    } catch {
-    }
+    } catch {}
   }
   function parseShaderStages(stages) {
     return sortShaderStages(normalizeShaderStages(cloneShaderStages(stages)));
@@ -55440,8 +55445,7 @@ function createShaderStageRuntime(options) {
     for (let i3 = 0;i3 < compiledWebGPUShaderStages.length; i3 += 1) {
       try {
         compiledWebGPUShaderStages[i3].uniformBuffer.destroy();
-      } catch {
-      }
+      } catch {}
     }
     compiledWebGPUShaderStages = [];
   }
@@ -55463,8 +55467,7 @@ function createShaderStageRuntime(options) {
       webgpuStageTargets.sceneTexture.destroy();
       webgpuStageTargets.pingTexture.destroy();
       webgpuStageTargets.pongTexture.destroy();
-    } catch {
-    }
+    } catch {}
     webgpuStageTargets = null;
   }
   function destroyWebGLStageTargets(state2) {
@@ -56644,8 +56647,7 @@ function createPointerAuxHandlers(options) {
   const {
     inputHandler,
     shouldRoutePointerToAppMouse,
-    scrollViewportByWheel = () => {
-    },
+    scrollViewportByWheel = () => {},
     getWasmReady,
     getWasmHandle,
     getGridState,
@@ -56811,8 +56813,7 @@ function bindPointerEvents(options) {
     clearPendingDesktopSelection,
     tryActivatePendingTouchSelection,
     beginSelectionDrag,
-    scrollViewportByWheel = () => {
-    },
+    scrollViewportByWheel = () => {},
     normalizeSelectionCell: normalizeSelectionCell2,
     positionToCell: positionToCell2,
     scrollViewportByLines,
@@ -56833,7 +56834,7 @@ function bindPointerEvents(options) {
   const applyTouchPan = (event, deltaPx) => {
     if (!deltaPx)
       return;
-    if (shouldRoutePointerToAppMouse(event.shiftKey) && inputHandler.isMouseActive()) {
+    if (shouldRoutePointerToAppMouse(event.shiftKey)) {
       const wheelLike = {
         deltaY: -deltaPx,
         deltaMode: 0,
@@ -57135,23 +57136,17 @@ function createNativeScrollbarHost(options) {
   const { canvas, getGridState, noteScrollActivity, setViewportScrollOffset } = options;
   if (typeof document === "undefined") {
     return {
-      flash: () => {
-      },
-      sync: () => {
-      },
-      destroy: () => {
-      }
+      flash: () => {},
+      sync: () => {},
+      destroy: () => {}
     };
   }
   const parent = canvas.parentElement;
   if (!parent) {
     return {
-      flash: () => {
-      },
-      sync: () => {
-      },
-      destroy: () => {
-      }
+      flash: () => {},
+      sync: () => {},
+      destroy: () => {}
     };
   }
   ensureNativeScrollbarStyles();
@@ -57821,8 +57816,7 @@ function createKittyImageCache(options) {
     if (source && typeof source.close === "function") {
       try {
         source.close();
-      } catch {
-      }
+      } catch {}
     }
   };
   const decodeRawKittyImage = (placement, key, bytes) => {
@@ -57837,34 +57831,34 @@ function createKittyImageCache(options) {
         return null;
       for (let i3 = 0;i3 < pixelCount; i3 += 1) {
         const v = bytes[i3] ?? 0;
-        const o3 = i3 * 4;
-        out[o3] = v;
-        out[o3 + 1] = v;
-        out[o3 + 2] = v;
-        out[o3 + 3] = 255;
+        const o = i3 * 4;
+        out[o] = v;
+        out[o + 1] = v;
+        out[o + 2] = v;
+        out[o + 3] = 255;
       }
     } else if (placement.imageFormat === KITTY_FMT_GRAY_ALPHA) {
       if (bytes.length < pixelCount * 2)
         return null;
       for (let i3 = 0;i3 < pixelCount; i3 += 1) {
-        const o3 = i3 * 4;
+        const o = i3 * 4;
         const s3 = i3 * 2;
         const v = bytes[s3] ?? 0;
-        out[o3] = v;
-        out[o3 + 1] = v;
-        out[o3 + 2] = v;
-        out[o3 + 3] = bytes[s3 + 1] ?? 255;
+        out[o] = v;
+        out[o + 1] = v;
+        out[o + 2] = v;
+        out[o + 3] = bytes[s3 + 1] ?? 255;
       }
     } else if (placement.imageFormat === KITTY_FMT_RGB) {
       if (bytes.length < pixelCount * 3)
         return null;
       for (let i3 = 0;i3 < pixelCount; i3 += 1) {
-        const o3 = i3 * 4;
+        const o = i3 * 4;
         const s3 = i3 * 3;
-        out[o3] = bytes[s3] ?? 0;
-        out[o3 + 1] = bytes[s3 + 1] ?? 0;
-        out[o3 + 2] = bytes[s3 + 2] ?? 0;
-        out[o3 + 3] = 255;
+        out[o] = bytes[s3] ?? 0;
+        out[o + 1] = bytes[s3 + 1] ?? 0;
+        out[o + 2] = bytes[s3 + 2] ?? 0;
+        out[o + 3] = 255;
       }
     } else if (placement.imageFormat === KITTY_FMT_RGBA) {
       if (bytes.length < pixelCount * 4)
@@ -58013,16 +58007,14 @@ function createKittyRenderRuntime(options) {
       return;
     try {
       entry.gl.deleteTexture(entry.texture);
-    } catch {
-    }
+    } catch {}
   };
   const releaseWebGPUTexture = (entry) => {
     if (!entry)
       return;
     try {
       entry.texture.destroy();
-    } catch {
-    }
+    } catch {}
   };
   const pruneWebGLTextures = (activeImageIds) => {
     for (const [imageId, entry] of webglTextures.entries()) {
@@ -58252,8 +58244,7 @@ function createLifecycleCanvasHandlers(deps) {
       for (const atlas of activeState.glyphAtlases.values()) {
         try {
           activeState.gl.deleteTexture(atlas.texture);
-        } catch {
-        }
+        } catch {}
       }
       activeState.glyphAtlases.clear();
       return;
@@ -58261,8 +58252,7 @@ function createLifecycleCanvasHandlers(deps) {
     for (const atlas of activeState.glyphAtlases.values()) {
       try {
         atlas.texture.destroy();
-      } catch {
-      }
+      } catch {}
     }
     activeState.glyphAtlases.clear();
   }
@@ -59775,8 +59765,7 @@ function populateWebGLOverlays(ctx) {
       return shapeClusterWithFont(preeditEntry, value).advance * preeditScale;
     });
     const visiblePreeditText = fittedPreedit.text;
-    if (!visiblePreeditText) {
-    } else {
+    if (!visiblePreeditText) {} else {
       const shaped = shapeClusterWithFont(preeditEntry, visiblePreeditText);
       noteColorGlyphText(preeditEntry, visiblePreeditText, shaped);
       const glyphSet = getGlyphSet(preeditFontIndex);
@@ -61802,8 +61791,7 @@ function createFontRuntimeGridHelpers(options) {
       for (const atlas of activeState.glyphAtlases.values()) {
         try {
           activeState.gl.deleteTexture(atlas.texture);
-        } catch {
-        }
+        } catch {}
       }
       activeState.glyphAtlases.clear();
       return;
@@ -61811,8 +61799,7 @@ function createFontRuntimeGridHelpers(options) {
     for (const atlas of activeState.glyphAtlases.values()) {
       try {
         atlas.texture.destroy();
-      } catch {
-      }
+      } catch {}
     }
     activeState.glyphAtlases.clear();
   }
@@ -62635,8 +62622,7 @@ function createRuntimeAppApi(options) {
     if (!ptyTransport.isConnected())
       return;
     if (options.readOnly) {
-      while (shared.wasm.drainOutput(shared.wasmHandle)) {
-      }
+      while (shared.wasm.drainOutput(shared.wasmHandle)) {}
       return;
     }
     let iterations = 0;
@@ -62726,8 +62712,7 @@ function createRuntimeAppApi(options) {
     const canvas = getCanvas();
     shared.wasm.setPixelSize(shared.wasmHandle, canvas.width, canvas.height);
     shared.wasm.writeBytes(shared.wasmHandle, data);
-    while (shared.wasm.drainOutput(shared.wasmHandle)) {
-    }
+    while (shared.wasm.drainOutput(shared.wasmHandle)) {}
     markSearchDirty();
     if (inputHandler.isSynchronizedOutput?.()) {
       ptyInputRuntime.scheduleSyncOutputReset();
@@ -62805,8 +62790,7 @@ function createRuntimeAppApi(options) {
     }
     try {
       shared.wasm.destroy(shared.wasmHandle);
-    } catch {
-    }
+    } catch {}
     writeState({ wasmHandle: nextHandle });
     rehydrateInputModesAfterSnapshotImport(nextHandle);
     ptyInputRuntime.cancelSyncOutputReset();
@@ -62868,8 +62852,7 @@ function createRuntimeAppApi(options) {
         }
         try {
           shared.wasm?.destroy(shared.wasmHandle);
-        } catch {
-        }
+        } catch {}
         writeState({ wasmHandle: nextHandle, needsRender: true });
         rehydrateInputModesAfterSnapshotImport(nextHandle);
         ptyInputRuntime.cancelSyncOutputReset();
@@ -63194,8 +63177,7 @@ function createRuntimeAppApi(options) {
     if (shared.wasm && shared.wasmHandle) {
       try {
         shared.wasm.destroy(shared.wasmHandle);
-      } catch {
-      }
+      } catch {}
       writeState({ wasmHandle: 0 });
     }
     clearWebGPUShaderStages();
@@ -63452,8 +63434,7 @@ function createResttyApp(options) {
       for (const atlas of state2.glyphAtlases.values()) {
         try {
           state2.gl.deleteTexture(atlas.texture);
-        } catch {
-        }
+        } catch {}
       }
       state2.glyphAtlases.clear();
       return;
@@ -63461,8 +63442,7 @@ function createResttyApp(options) {
     for (const atlas of state2.glyphAtlases.values()) {
       try {
         atlas.texture.destroy();
-      } catch {
-      }
+      } catch {}
     }
     state2.glyphAtlases.clear();
   }
@@ -63672,6 +63652,8 @@ function createResttyApp(options) {
     suppressQueryReplies: options.readOnly === true,
     positionToCell: positionToCell2,
     positionToPixel,
+    getCellHeight: () => Math.max(1, gridState.cellH || 20),
+    getRows: () => Math.max(1, gridState.rows || 24),
     getDefaultColors: () => ({
       fg: floatsToRgb(defaultFg),
       bg: floatsToRgb(defaultBg),
@@ -63962,20 +63944,16 @@ function createResttyApp(options) {
     destroyWebGPUAtlasState(state2);
     try {
       state2.uniformBuffer.destroy();
-    } catch {
-    }
+    } catch {}
     try {
       state2.rectInstanceBuffer.destroy();
-    } catch {
-    }
+    } catch {}
     try {
       state2.glyphInstanceBuffer.destroy();
-    } catch {
-    }
+    } catch {}
     try {
       state2.context.unconfigure?.();
-    } catch {
-    }
+    } catch {}
   }
   function destroyWebGLState(state2) {
     destroyWebGLAtlasState(state2);
@@ -63984,40 +63962,31 @@ function createResttyApp(options) {
       state2.gl.bindBuffer(state2.gl.ARRAY_BUFFER, null);
       state2.gl.bindFramebuffer(state2.gl.FRAMEBUFFER, null);
       state2.gl.useProgram(null);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteVertexArray(state2.rectVao);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteVertexArray(state2.glyphVao);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteBuffer(state2.quadBuffer);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteBuffer(state2.rectInstanceBuffer);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteBuffer(state2.glyphInstanceBuffer);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteProgram(state2.rectProgram);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.deleteProgram(state2.glyphProgram);
-    } catch {
-    }
+    } catch {}
     try {
       state2.gl.getExtension("WEBGL_lose_context")?.loseContext();
-    } catch {
-    }
+    } catch {}
   }
   function destroyActiveRendererState(state2) {
     if (!state2)
@@ -65453,8 +65422,7 @@ function teardownPluginRuntime(runtime) {
   for (let i3 = 0;i3 < runtime.disposers.length; i3 += 1) {
     try {
       runtime.disposers[i3].dispose();
-    } catch {
-    }
+    } catch {}
   }
   runtime.disposers.length = 0;
   const cleanup = runtime.cleanup;
