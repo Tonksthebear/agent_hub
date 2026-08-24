@@ -5,8 +5,8 @@ server configuration and ships Botster workflow skills so agents do not need
 manual MCP setup or generic default MCP prompt discovery.
 
 Botster Lua plugins still own the runtime tool surface. This package only
-connects the agent to `botster mcp-serve` and teaches the agent how to use the
-hub, session, messaging, and orchestration tools correctly.
+connects the agent to the Hub-owned Streamable HTTP MCP server and teaches the
+agent how to use the hub, session, messaging, and orchestration tools correctly.
 
 The same `skills/` directory is shared by the Codex and Claude plugin manifests
 in this package. Update those skill files once and both agent runtimes receive
@@ -36,16 +36,21 @@ source.
 
 ## MCP Server
 
-The MCP server forwards `BOTSTER_SESSION_UUID` so the hub can resolve the
-calling session:
+The Hub owns one Streamable HTTP MCP listener. Each session receives
+`BOTSTER_MCP_URL` and a caller-specific `BOTSTER_MCP_TOKEN`. Clients must not
+share those credentials across sessions.
 
 ```json
 {
   "mcpServers": {
     "botster": {
-      "command": "botster",
-      "args": ["mcp-serve"],
-      "env_vars": ["BOTSTER_SESSION_UUID"],
+      "type": "http",
+      "url": "${BOTSTER_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${BOTSTER_MCP_TOKEN}"
+      },
+      "bearer_token_env_var": "BOTSTER_MCP_TOKEN",
+      "env_vars": ["BOTSTER_MCP_URL", "BOTSTER_MCP_TOKEN"],
       "default_tools_approval_mode": "approve",
       "default_tools_enabled": true
     }

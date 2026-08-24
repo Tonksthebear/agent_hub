@@ -6,8 +6,9 @@ description: Use when exposing MCP tools, prompts, or resource templates from Bo
 # Botster Customize MCP
 
 Botster Lua plugins register MCP tools and prompts through `lib.mcp`. Agents
-connect to them through the single `botster` MCP server configured by this
-agent plugin.
+connect to them through the Hub-owned Streamable HTTP MCP server configured by
+this agent plugin. Each caller presents `BOTSTER_MCP_TOKEN`. Tool calls stay
+caller-specific.
 
 ## Tool
 

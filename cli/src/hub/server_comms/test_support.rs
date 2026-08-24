@@ -60,6 +60,12 @@ pub(super) fn e2e_hub() -> (
             std::sync::Arc::clone(&hub.shared_color_cache),
         )
         .expect("Should register hub primitives");
+    crate::mcp_http::register_lua(
+        hub.lua.lua(),
+        hub.mcp_callers.clone(),
+        hub.mcp_http_fanout.clone(),
+    )
+    .expect("Should register shared MCP HTTP primitives");
 
     // Load real Lua handlers (init.lua and all handlers)
     hub.load_lua_init();

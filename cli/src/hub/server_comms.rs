@@ -294,6 +294,14 @@ impl Hub {
             HubEvent::SocketSend(send_req) => {
                 self.handle_socket_send_event(send_req);
             }
+            HubEvent::McpHttpRequest {
+                caller,
+                method,
+                params,
+                reply,
+            } => {
+                crate::mcp_http::dispatch_lua_mcp(self.lua.lua(), &caller, &method, params, reply);
+            }
             HubEvent::LuaPtyRequest(request) => {
                 self.handle_lua_pty_request_event(request);
             }

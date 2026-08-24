@@ -337,6 +337,21 @@ pub(crate) enum HubEvent {
     /// Lua's `socket.send(client_id, msg)` pushes this event.
     SocketSend(crate::lua::primitives::socket::SocketSendRequest),
 
+    /// Authorized Streamable HTTP MCP request from the Hub-owned listener.
+    ///
+    /// The HTTP layer already bound a caller credential. The event loop must
+    /// dispatch Lua MCP with that caller only.
+    McpHttpRequest {
+        /// Authorized caller identity.
+        caller: crate::mcp_http::McpCaller,
+        /// MCP method name such as `tools/list`.
+        method: String,
+        /// JSON-RPC params object.
+        params: serde_json::Value,
+        /// Reply channel for the waiting HTTP request.
+        reply: crate::mcp_http::McpHttpReplyTx,
+    },
+
     /// A queued message was successfully delivered to an agent PTY.
     ///
     /// Sent from the message delivery task after probe succeeded and
@@ -465,6 +480,7 @@ impl HubEvent {
             Self::SocketClientDisconnected { .. } => "socket_client_disconnected",
             Self::SocketMessage { .. } => "socket_message",
             Self::SocketSend(_) => "socket_send",
+            Self::McpHttpRequest { .. } => "mcp_http_request",
             Self::MessageDelivered { .. } => "message_delivered",
             Self::SessionProcessExited { .. } => "session_process_exited",
             Self::SessionReconnectReady { .. } => "session_reconnect_ready",
@@ -502,7 +518,8 @@ impl HubEvent {
             | Self::SocketClientConnected { .. }
             | Self::SocketClientDisconnected { .. }
             | Self::SocketMessage { .. }
-            | Self::SocketSend(_) => true,
+            | Self::SocketSend(_)
+            | Self::McpHttpRequest { .. } => true,
             _ => false,
         }
     }

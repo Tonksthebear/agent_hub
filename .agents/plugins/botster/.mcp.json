@@ -1,9 +1,13 @@
 {
   "mcpServers": {
     "botster": {
-      "command": "botster",
-      "args": ["mcp-serve"],
-      "env_vars": ["BOTSTER_SESSION_UUID"],
+      "type": "http",
+      "url": "${BOTSTER_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${BOTSTER_MCP_TOKEN}"
+      },
+      "bearer_token_env_var": "BOTSTER_MCP_TOKEN",
+      "env_vars": ["BOTSTER_MCP_URL", "BOTSTER_MCP_TOKEN"],
       "default_tools_approval_mode": "approve",
       "default_tools_enabled": true
     }

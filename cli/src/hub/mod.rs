@@ -426,6 +426,12 @@ pub struct Hub {
     // === Socket IPC ===
     /// Unix domain socket server for external client connections.
     socket_server: Option<crate::socket::server::SocketServer>,
+    /// Caller credentials for the shared Streamable HTTP MCP listener.
+    pub(crate) mcp_callers: crate::mcp_http::McpCallerRegistry,
+    /// SSE fan-out for MCP list-changed notifications.
+    pub(crate) mcp_http_fanout: crate::mcp_http::McpHttpFanout,
+    /// Hub-owned Streamable HTTP MCP listener.
+    mcp_http_listener: Option<crate::mcp_http::McpHttpListener>,
     /// Connected socket clients, keyed by client_id.
     socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
     /// Workerized terminal clients, keyed by terminal subscription id.
@@ -603,6 +609,9 @@ impl Hub {
             push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
             singleton_lock: None,
             socket_server: None,
+            mcp_callers: crate::mcp_http::McpCallerRegistry::new(),
+            mcp_http_fanout: crate::mcp_http::McpHttpFanout::new(),
+            mcp_http_listener: None,
             socket_clients: std::collections::HashMap::new(),
             terminal_client_workers: std::collections::HashMap::new(),
             browser_client_workers: std::collections::HashMap::new(),
@@ -741,6 +750,13 @@ impl Hub {
             Arc::clone(&self.shared_color_cache),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
+        }
+        if let Err(e) = crate::mcp_http::register_lua(
+            self.lua.lua(),
+            self.mcp_callers.clone(),
+            self.mcp_http_fanout.clone(),
+        ) {
+            log::warn!("Failed to register shared MCP HTTP Lua primitives: {}", e);
         }
 
         // Load Lua init script (hot-reload is now handled by Lua's module_watcher)
@@ -888,10 +904,14 @@ impl Hub {
             &self.hub_identifier[..self.hub_identifier.len().min(8)]
         );
         self.socket_server = Some(server);
+        self.start_mcp_http_server();
 
         // Persist ownership metadata after a successful bind so failed startup
         // attempts never steal pid/manifest ownership from a live hub.
-        if let Err(e) = artifacts.publish_current_process(self.botster_id.as_deref()) {
+        if let Err(e) = artifacts.publish_current_process_with_mcp(
+            self.botster_id.as_deref(),
+            self.mcp_callers.url().as_deref(),
+        ) {
             log::warn!("Failed to publish hub runtime artifacts: {e}");
         }
 
@@ -917,6 +937,30 @@ impl Hub {
 
         self.fire_hub_recovery_state("ready", serde_json::json!({}));
         Ok(())
+    }
+
+    /// Start the Hub-owned Streamable HTTP MCP listener on loopback.
+    ///
+    /// Every session reuses this one listener. Caller credentials stay in
+    /// process memory and are issued when a session builds its environment.
+    pub(crate) fn start_mcp_http_server(&mut self) {
+        if self.mcp_http_listener.is_some() {
+            return;
+        }
+        let _guard = self.tokio_runtime.enter();
+        match self.tokio_runtime.block_on(crate::mcp_http::bind_listener(
+            self.mcp_callers.clone(),
+            self.mcp_http_fanout.clone(),
+            crate::mcp_http::McpHttpDispatch::Hub(self.hub_event_tx.clone()),
+        )) {
+            Ok(listener) => {
+                log::info!("Shared MCP HTTP listener ready at {}", listener.url());
+                self.mcp_http_listener = Some(listener);
+            }
+            Err(e) => {
+                log::error!("Failed to start shared MCP HTTP listener: {e}");
+            }
+        }
     }
 
     /// Rebind the public hub socket if its pathname was unlinked while the
@@ -959,7 +1003,10 @@ impl Hub {
         match crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone()) {
             Ok(server) => {
                 self.socket_server = Some(server);
-                if let Err(e) = artifacts.publish_current_process(self.botster_id.as_deref()) {
+                if let Err(e) = artifacts.publish_current_process_with_mcp(
+                    self.botster_id.as_deref(),
+                    self.mcp_callers.url().as_deref(),
+                ) {
                     log::warn!("[Socket] Failed to refresh runtime artifacts after repair: {e}");
                 }
                 self.fire_hub_recovery_state(
@@ -1093,6 +1140,10 @@ impl Hub {
         if let Some(server) = self.socket_server.take() {
             server.shutdown();
         }
+        if let Some(mut listener) = self.mcp_http_listener.take() {
+            listener.shutdown();
+        }
+        self.mcp_callers.revoke_all();
         // Release singleton lock (flock released on fd close)
         if let Some(lock) = self.singleton_lock.take() {
             log::info!("Released singleton lock: {}", lock.path.display());

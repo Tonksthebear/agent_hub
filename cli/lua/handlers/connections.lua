@@ -775,6 +775,9 @@ end)
 
 -- Notify MCP clients when tool list changes
 _event_subs[#_event_subs + 1] = events.on("mcp_tools_changed", function()
+    if type(hub.notify_mcp_list_changed) == "function" then
+        pcall(hub.notify_mcp_list_changed, "tools")
+    end
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions) do
             if sub.channel == "mcp" then
@@ -788,6 +791,9 @@ _event_subs[#_event_subs + 1] = events.on("mcp_tools_changed", function()
 end)
 
 _event_subs[#_event_subs + 1] = events.on("mcp_prompts_changed", function()
+    if type(hub.notify_mcp_list_changed) == "function" then
+        pcall(hub.notify_mcp_list_changed, "prompts")
+    end
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions) do
             if sub.channel == "mcp" then
@@ -801,6 +807,9 @@ _event_subs[#_event_subs + 1] = events.on("mcp_prompts_changed", function()
 end)
 
 _event_subs[#_event_subs + 1] = events.on("mcp_resources_changed", function()
+    if type(hub.notify_mcp_list_changed) == "function" then
+        pcall(hub.notify_mcp_list_changed, "resources")
+    end
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions) do
             if sub.channel == "mcp" then

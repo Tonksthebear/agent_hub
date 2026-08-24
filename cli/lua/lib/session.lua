@@ -1082,6 +1082,10 @@ function Session:close(delete_worktree)
     -- Notify observers
     hooks.notify("before_agent_close", self)
 
+    if type(hub.revoke_mcp_caller) == "function" then
+        pcall(hub.revoke_mcp_caller, self.session_uuid)
+    end
+
     -- Unregister from HandleCache
     local ok, err = pcall(hub.unregister_session, self.session_uuid)
     if not ok then
@@ -1209,6 +1213,21 @@ function Session:build_env(base_env)
     if self.target_path then env.BOTSTER_TARGET_PATH = self.target_path end
     if self.target_repo then env.BOTSTER_TARGET_REPO = self.target_repo end
     env.BOTSTER_SESSION_UUID = self.session_uuid
+    -- Shared HTTP MCP: one Hub listener, one caller credential per session.
+    if type(hub.issue_mcp_caller) == "function" then
+        local creds_ok, creds = pcall(hub.issue_mcp_caller, {
+            session_uuid = self.session_uuid,
+            hub_id = hub.server_id() or hub.hub_id() or "",
+            context = {
+                workspace_id = self.workspace_id or "",
+                agent_name = self.agent_name or "",
+            },
+        })
+        if creds_ok and type(creds) == "table" and creds.url and creds.token then
+            env.BOTSTER_MCP_URL = creds.url
+            env.BOTSTER_MCP_TOKEN = creds.token
+        end
+    end
     -- Ensure child processes (e.g., botster mcp-serve) use the same binary and
     -- data directory as the hub, even if a different build is installed on PATH.
     if self._data_dir then

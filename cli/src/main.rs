@@ -1395,12 +1395,23 @@ fn main() -> Result<()> {
         Commands::Attach => {
             run_attach()?;
         }
-        Commands::McpServe => match resolve_mcp_serve_socket()? {
-            Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
-            None => botster::mcp_gateway::run_disconnected(
-                "Botster MCP is available only inside a Botster-managed session",
-            )?,
-        },
+        Commands::McpServe => {
+            let url = std::env::var("BOTSTER_MCP_URL")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let token = std::env::var("BOTSTER_MCP_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty());
+            match (url, token) {
+                (Some(url), Some(token)) => botster::mcp_http::run_stdio_proxy(&url, &token)?,
+                _ => match resolve_mcp_serve_socket()? {
+                    Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
+                    None => botster::mcp_gateway::run_disconnected(
+                        "Botster MCP is available only inside a Botster-managed session",
+                    )?,
+                },
+            }
+        }
         Commands::Context { key, value } => {
             commands::context::run(key.as_deref(), value.as_deref())?;
         }

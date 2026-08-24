@@ -288,6 +288,7 @@ impl Hub {
     }
 
     pub(super) fn handle_session_unregistered_event(&mut self, session_uuid: String) {
+        self.mcp_callers.revoke_session(&session_uuid);
         self.cleanup_pending_session_io_snapshots_for_session(&session_uuid);
         self.cleanup_paste_files(&session_uuid);
         self.terminal_profiles.clear_session(&session_uuid);

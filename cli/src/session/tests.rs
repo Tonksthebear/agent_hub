@@ -470,6 +470,7 @@ mod hub_manifest_tests {
             pid: 1234,
             updated_at: 0,
             workspaces: vec!["ws-1".to_string(), "ws-2".to_string()],
+            mcp_url: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let decoded: HubManifest = serde_json::from_str(&json).unwrap();
@@ -498,11 +499,16 @@ mod hub_manifest_tests {
             pid: 1234,
             updated_at: 0,
             workspaces: Vec::new(),
+            mcp_url: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(
             !json.contains("workspaces"),
             "empty workspaces should be skipped in serialization"
+        );
+        assert!(
+            !json.contains("mcp_url"),
+            "absent MCP URL should be skipped in serialization"
         );
     }
 }

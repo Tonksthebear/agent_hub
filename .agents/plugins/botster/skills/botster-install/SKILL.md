@@ -19,16 +19,16 @@ The agent plugin should provide this MCP server automatically:
 
 ```toml
 [mcp_servers.botster]
-command = "botster"
-args = ["mcp-serve"]
-env_vars = ["BOTSTER_SESSION_UUID"]
+url = "${BOTSTER_MCP_URL}"
+bearer_token_env_var = "BOTSTER_MCP_TOKEN"
+env_vars = ["BOTSTER_MCP_URL", "BOTSTER_MCP_TOKEN"]
 default_tools_approval_mode = "approve"
 default_tools_enabled = true
 ```
 
-Do not add duplicate Botster MCP aliases. `botster mcp-serve` resolves caller
-identity from `BOTSTER_SESSION_UUID`; duplicate aliases make tool discovery
-noisy without adding capability.
+Do not add duplicate Botster MCP aliases. The Hub owns one HTTP listener.
+Each session receives its own `BOTSTER_MCP_TOKEN`. Duplicate aliases make
+tool discovery noisy without adding capability.
 
 ## CLI Installation
 

@@ -32,6 +32,7 @@ pub mod commands;
 pub mod hub;
 pub mod lua;
 pub mod mcp_gateway;
+pub mod mcp_http;
 pub mod relay;
 pub mod session;
 pub mod socket;

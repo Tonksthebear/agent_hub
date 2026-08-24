@@ -120,8 +120,17 @@ impl HubRuntimeArtifacts {
 
     /// Write PID and manifest for the current process.
     pub fn publish_current_process(&self, server_id: Option<&str>) -> Result<()> {
+        self.publish_current_process_with_mcp(server_id, None)
+    }
+
+    /// Write PID and manifest, including the shared MCP HTTP URL when ready.
+    pub fn publish_current_process_with_mcp(
+        &self,
+        server_id: Option<&str>,
+        mcp_url: Option<&str>,
+    ) -> Result<()> {
         write_pid_file(&self.hub_id)?;
-        write_manifest(&self.hub_id, server_id)
+        write_manifest_details(&self.hub_id, server_id, mcp_url)
     }
 
     /// Inspect runtime artifacts without mutating them.
@@ -204,6 +213,9 @@ pub struct HubManifest {
     /// Empty workspaces (no sessions) are automatically removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<String>,
+    /// Shared Streamable HTTP MCP URL owned by this Hub process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
 }
 
 /// Get the per-hub directory path.
@@ -263,6 +275,15 @@ pub fn write_pid_file(hub_id: &str) -> Result<()> {
 
 /// Write or update the hub runtime manifest.
 pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
+    write_manifest_details(hub_id, server_id, None)
+}
+
+/// Write the hub runtime manifest, including the shared MCP URL when present.
+pub fn write_manifest_details(
+    hub_id: &str,
+    server_id: Option<&str>,
+    mcp_url: Option<&str>,
+) -> Result<()> {
     let started = Instant::now();
     let socket = socket_path(hub_id)?;
     let path = manifest_path(hub_id)?;
@@ -278,6 +299,9 @@ pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
             .unwrap_or_default()
             .as_secs(),
         workspaces: Vec::new(),
+        mcp_url: mcp_url
+            .filter(|s| !s.is_empty())
+            .map(std::string::ToString::to_string),
     };
     let content =
         serde_json::to_string_pretty(&manifest).context("Failed to serialize hub manifest")?;
@@ -926,6 +950,7 @@ mod tests {
             pid: 999999,
             updated_at: 1,
             workspaces: Vec::new(),
+            mcp_url: None,
         };
         let manifest_content = serde_json::to_string_pretty(&manifest).unwrap();
         fs::write(manifest_path(&test_id).unwrap(), manifest_content).unwrap();
@@ -1057,6 +1082,7 @@ mod tests {
             pid: 999999,
             updated_at: 1,
             workspaces: Vec::new(),
+            mcp_url: None,
         };
 
         fs::write(&pid_path, "999999").unwrap();
