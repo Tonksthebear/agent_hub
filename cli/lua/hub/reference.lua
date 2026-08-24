@@ -404,8 +404,10 @@ M.mcp_api = {
     prompts = {
         { sig = "mcp.prompt(name, schema, handler)",          desc = "Register a prompt. handler(args) → string or message shape" },
         { sig = "mcp.remove_prompt(name)",                    desc = "Remove a prompt by name" },
-        { sig = "mcp.list_prompts()",                         desc = "List all prompts" },
-        { sig = "mcp.get_prompt(name, args)",                 desc = "Execute a prompt handler" },
+        { sig = "mcp.list_prompts(session_uuid?)",             desc = "List prompts (optionally scoped to session's plugins)" },
+        { sig = "mcp.get_prompt(name, args, context?)",        desc = "Execute a prompt handler with optional caller context" },
+        { sig = "mcp.list_resource_templates(session_uuid?)",  desc = "List resource templates (optionally scoped to session's plugins)" },
+        { sig = "mcp.caller_context(session_uuid)",            desc = "Build live MCP caller context from the session manifest" },
         { sig = "mcp.count_prompts()",                        desc = "Count registered prompts" },
     },
     proxy = {

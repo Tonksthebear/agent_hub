@@ -718,6 +718,15 @@ function Session._init_recovered(self, config)
 
     log.info(string.format("Session recovered: %s (uuid=%s, type=%s)",
         key, self.session_uuid, self.session_type))
+
+    -- Re-issue the caller credential so a Hub restart restores the same
+    -- persisted token. The live agent process already has that token in env.
+    if type(hub.issue_mcp_caller) == "function" then
+        pcall(hub.issue_mcp_caller, {
+            session_uuid = self.session_uuid,
+            hub_id = hub.hub_id() or hub.server_id() or "",
+        })
+    end
 end
 
 -- =============================================================================
@@ -1217,11 +1226,7 @@ function Session:build_env(base_env)
     if type(hub.issue_mcp_caller) == "function" then
         local creds_ok, creds = pcall(hub.issue_mcp_caller, {
             session_uuid = self.session_uuid,
-            hub_id = hub.server_id() or hub.hub_id() or "",
-            context = {
-                workspace_id = self.workspace_id or "",
-                agent_name = self.agent_name or "",
-            },
+            hub_id = hub.hub_id() or hub.server_id() or "",
         })
         if creds_ok and type(creds) == "table" and creds.url and creds.token then
             env.BOTSTER_MCP_URL = creds.url

@@ -371,48 +371,120 @@ function M.tools_for_session(session_uuid)
     return result
 end
 
+--- Load live session fields, or the persisted session manifest.
+-- Live objects win so a workspace move or rename is visible on the next call.
+-- @param session_uuid string Session UUID
+-- @return table|nil Session-like table with identity fields
+local function session_record(session_uuid)
+    if type(session_uuid) ~= "string" or session_uuid == "" then
+        return nil
+    end
+
+    local Session = require("lib.session")
+    local session = Session.get(session_uuid)
+    if session then
+        return {
+            session_uuid = session.session_uuid or session_uuid,
+            session_name = session.session_name,
+            agent_name = session.agent_name,
+            branch_name = session.branch_name,
+            repo = session.repo,
+            workspace_id = session._workspace_id or session.workspace_id,
+            worktree_path = session.worktree_path,
+            session_dir = session.session_dir,
+            target_id = session.target_id,
+            target_path = session.target_path,
+        }
+    end
+
+    local data_dir = config.data_dir and config.data_dir() or nil
+    if not data_dir then return nil end
+
+    local WorkspaceStore = require("lib.workspace_store")
+    local ws_dir = data_dir .. "/workspaces"
+    if not (fs.exists(ws_dir) and fs.is_dir(ws_dir)) then
+        return nil
+    end
+    for _, ws_id in ipairs(fs.listdir(ws_dir) or {}) do
+        if fs.is_dir(ws_dir .. "/" .. ws_id) then
+            local manifest = WorkspaceStore.read_session(data_dir, ws_id, session_uuid)
+            if manifest then
+                manifest.session_uuid = manifest.session_uuid or session_uuid
+                manifest.workspace_id = manifest.workspace_id or ws_id
+                return manifest
+            end
+        end
+    end
+    return nil
+end
+
+--- Build caller context from the live session or its persisted manifest.
+-- Used at MCP dispatch time so a token never carries stale workspace or
+-- agent fields, and so hub_id matches the session manifest rule.
+-- @param session_uuid string Session UUID
+-- @return table Context map of non-empty string fields
+function M.caller_context(session_uuid)
+    local context = { session_uuid = session_uuid }
+    local hub_id = (hub.hub_id and hub.hub_id()) or (hub.server_id and hub.server_id()) or ""
+    if type(hub_id) == "string" and hub_id ~= "" then
+        context.hub_id = hub_id
+    end
+
+    local record = session_record(session_uuid)
+    if not record then
+        return context
+    end
+
+    local keys = {
+        "session_name",
+        "agent_name",
+        "branch_name",
+        "repo",
+        "workspace_id",
+        "worktree_path",
+        "session_dir",
+        "hub_id",
+        "hub_manifest_path",
+        "prompt",
+    }
+    for _, key in ipairs(keys) do
+        local value = record[key]
+        if type(value) == "string" and value ~= "" and context[key] == nil then
+            context[key] = value
+        end
+    end
+    return context
+end
+
+--- Return true when a plugin-owned MCP item is visible to this session.
+-- Builtin items (plugin_name is nil) are always visible.
+local function plugin_allowed_for_session(plugin_name, session_uuid)
+    if not plugin_name or not session_uuid then
+        return true
+    end
+    local allowed = M.resolve_session_plugins(session_uuid)
+    if not allowed then
+        return true
+    end
+    return allowed[plugin_name] == true
+end
+
 --- Resolve which plugins a session is allowed to use.
 -- Returns a set (table with plugin names as keys) if either target or agent
 -- restricts plugins. Returns nil when neither side restricts (all plugins available).
 -- @param session_uuid string Session UUID
 -- @return table|nil Set of allowed plugin names, or nil for unrestricted
 function M.resolve_session_plugins(session_uuid)
-    local data_dir = config.data_dir and config.data_dir() or nil
-    if not data_dir then return nil end
-
-    -- Look up live session object first (O(1), no filesystem I/O).
-    -- Falls back to manifest scan only if session isn't in memory.
-    local Session = require("lib.session")
-    local session = Session.get(session_uuid)
-
-    local target_id, agent_name, target_path
-    if session then
-        target_id = session.target_id
-        agent_name = session.agent_name
-        target_path = session.target_path
-    else
-        -- Session not in memory — read manifest from workspace store
-        local WorkspaceStore = require("lib.workspace_store")
-        local ws_dir = data_dir .. "/workspaces"
-        if fs.exists(ws_dir) and fs.is_dir(ws_dir) then
-            local ws_entries = fs.listdir(ws_dir) or {}
-            for _, ws_id in ipairs(ws_entries) do
-                if fs.is_dir(ws_dir .. "/" .. ws_id) then
-                    local m = WorkspaceStore.read_session(data_dir, ws_id, session_uuid)
-                    if m then
-                        target_id = m.target_id
-                        agent_name = m.agent_name
-                        target_path = m.target_path
-                        break
-                    end
-                end
-            end
-        end
-    end
+    local record = session_record(session_uuid)
+    local target_id = record and record.target_id
+    local agent_name = record and record.agent_name
+    local target_path = record and record.target_path
 
     -- If we can't determine the session's identity, allow all plugins.
     -- This covers testing, debugging, and MCP connections without session context.
     if not target_id and not agent_name then return nil end
+
+    local data_dir = config.data_dir and config.data_dir() or nil
 
     -- Get target plugins (availability ceiling)
     local target_plugins = nil
@@ -515,13 +587,10 @@ function M.call_tool(name, params, context, callback)
 
     -- Enforce session-scoped plugin access: if the tool belongs to a plugin
     -- and the caller has a session context, verify the tool is allowed.
-    if tool.plugin_name and context and context.session_uuid then
-        local allowed = M.resolve_session_plugins(context.session_uuid)
-        if allowed and not allowed[tool.plugin_name] then
-            local err = "Tool not available for this session: " .. name
-            if callback then callback(nil, err) return end
-            return nil, err
-        end
+    if not plugin_allowed_for_session(tool.plugin_name, context and context.session_uuid) then
+        local err = "Tool not available for this session: " .. name
+        if callback then callback(nil, err) return end
+        return nil, err
     end
 
     -- Proxied tool: forward the call to the remote MCP server via HTTP.
@@ -879,6 +948,7 @@ function M.prompt(name, schema, handler)
         handler = handler,
         source = caller_source(),
         owner_plugin = owner_plugin,
+        plugin_name = caller_plugin_name(),
         handler_id = owner_plugin and mcp_handler_id("prompt", name) or nil,
         timeout_ms = schema.timeout_ms or 5000,
     }
@@ -905,22 +975,26 @@ function M.remove_prompt(name)
     end
 end
 
---- List all registered prompts (metadata only, no handlers).
+--- List registered prompts (metadata only, no handlers).
+-- When session_uuid is provided, returns only prompts scoped to that session.
+-- @param session_uuid string|nil Optional session UUID for scoped prompt list
 -- @return array of { name, description, [arguments] }
 -- Note: arguments is omitted when empty. An empty Lua table serializes as {}
 -- (JSON object) rather than [] (JSON array), which fails MCP schema validation.
 -- The MCP spec marks arguments as optional, so omitting it is correct.
-function M.list_prompts()
+function M.list_prompts(session_uuid)
     local result = {}
     for _, prompt in pairs(prompts) do
-        local entry = {
-            name = prompt.name,
-            description = prompt.description,
-        }
-        if prompt.arguments and #prompt.arguments > 0 then
-            entry.arguments = prompt.arguments
+        if plugin_allowed_for_session(prompt.plugin_name, session_uuid) then
+            local entry = {
+                name = prompt.name,
+                description = prompt.description,
+            }
+            if prompt.arguments and #prompt.arguments > 0 then
+                entry.arguments = prompt.arguments
+            end
+            result[#result + 1] = entry
         end
-        result[#result + 1] = entry
     end
     return result
 end
@@ -932,11 +1006,15 @@ end
 -- wrapped into a single user message automatically.
 -- @param name string Prompt name
 -- @param args table Argument values from the MCP client (key = arg name)
+-- @param context table|nil Caller context; session_uuid scopes plugin prompts
 -- @return result table|nil, error string|nil
-function M.get_prompt(name, args)
+function M.get_prompt(name, args, context)
     local prompt = prompts[name]
     if not prompt then
         return nil, "Unknown prompt: " .. name
+    end
+    if not plugin_allowed_for_session(prompt.plugin_name, context and context.session_uuid) then
+        return nil, "Prompt not available for this session: " .. name
     end
 
     local ok, result
@@ -1053,6 +1131,7 @@ function M.resource(uri_template, schema, handler)
         handler = handler,
         source = caller_source(),
         owner_plugin = owner_plugin,
+        plugin_name = caller_plugin_name(),
         handler_id = owner_plugin and mcp_handler_id("resource", uri_template) or nil,
         timeout_ms = schema.timeout_ms or 5000,
         _pattern = pattern,
@@ -1081,17 +1160,21 @@ function M.remove_resource(uri_template)
     end
 end
 
---- List all registered resource templates (metadata only, no handlers).
+--- List registered resource templates (metadata only, no handlers).
+-- When session_uuid is provided, returns only templates scoped to that session.
+-- @param session_uuid string|nil Optional session UUID for scoped template list
 -- @return array of { uriTemplate, name, description, mimeType }
-function M.list_resource_templates()
+function M.list_resource_templates(session_uuid)
     local result = {}
     for _, rt in pairs(resource_templates) do
-        result[#result + 1] = {
-            uriTemplate = rt.uri_template,
-            name = rt.name,
-            description = rt.description,
-            mimeType = rt.mimeType,
-        }
+        if plugin_allowed_for_session(rt.plugin_name, session_uuid) then
+            result[#result + 1] = {
+                uriTemplate = rt.uri_template,
+                name = rt.name,
+                description = rt.description,
+                mimeType = rt.mimeType,
+            }
+        end
     end
     return result
 end
@@ -1124,6 +1207,11 @@ function M.read_resource(uri, context, callback)
 
     if not matched_template then
         local err = "No resource template matches URI: " .. uri
+        if callback then callback(nil, err) return end
+        return nil, err
+    end
+    if not plugin_allowed_for_session(matched_template.plugin_name, context and context.session_uuid) then
+        local err = "Resource not available for this session: " .. uri
         if callback then callback(nil, err) return end
         return nil, err
     end

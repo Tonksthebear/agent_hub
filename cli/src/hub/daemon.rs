@@ -242,6 +242,11 @@ pub fn manifest_path(hub_id: &str) -> Result<PathBuf> {
     Ok(hub_dir(hub_id)?.join("manifest.json"))
 }
 
+/// Persist path for shared MCP caller tokens and the listen port.
+pub fn mcp_callers_path(hub_id: &str) -> Result<PathBuf> {
+    Ok(hub_dir(hub_id)?.join("mcp_callers.json"))
+}
+
 /// Get the Unix socket path for a hub.
 ///
 /// Uses `/tmp/botster-{uid}/` instead of the config dir because macOS

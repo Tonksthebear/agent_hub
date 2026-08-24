@@ -22,20 +22,24 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
-use hyper::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use futures_util::{stream, StreamExt};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use mlua::LuaSerdeExt;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -69,8 +73,38 @@ const BODY_LIMIT: usize = 1024 * 1024;
 /// shared HTTP caller is not cut off sooner than a former per-session process.
 const HUB_DISPATCH_TIMEOUT: Duration = Duration::from_secs(86_400);
 
-/// How long initialize and list methods wait for the Hub event loop.
+/// How long initialize and ping wait for the Hub event loop.
 const HUB_QUICK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long list methods wait. `tools/list` can scan workspace manifests.
+///
+/// 15 seconds was too short on a busy Hub event loop. 120 seconds covers a
+/// disk walk without treating discovery as a long-running tool call.
+const HUB_LIST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Failed-auth attempts allowed in [`AUTH_FAIL_WINDOW`] before HTTP 429.
+///
+/// Loopback TCP is reachable by every local process. The bearer token is the
+/// only secret. This cap slows guessing without locking out a single retry.
+const AUTH_FAIL_LIMIT: u32 = 20;
+
+/// Sliding window for failed-auth counting.
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Socket `mcp-serve` fallback removal target.
+///
+/// Streamable HTTP is the durable transport. The stdio proxy and Unix-socket
+/// gateway remain only until this date.
+pub const SOCKET_MCP_FALLBACK_REMOVAL: &str = "2026-10-01";
+
+/// Streamable HTTP protocol versions this listener accepts.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Default Streamable HTTP protocol version when the client omits one.
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// HTTP body type that can be a finished JSON reply or a live SSE stream.
+type McpHttpBody = UnsyncBoxBody<Bytes, Infallible>;
 
 /// Bearer token that identifies one MCP caller.
 ///
@@ -115,6 +149,8 @@ pub struct McpCaller {
     pub session_uuid: String,
     /// Hub identity of the authorized caller.
     pub hub_id: String,
+    /// Streamable HTTP session id. This is not a Botster session UUID.
+    pub http_session_id: String,
     /// Extra caller context from the session, never another caller.
     pub context: HashMap<String, String>,
 }
@@ -131,6 +167,7 @@ impl McpCaller {
         Self {
             session_uuid,
             hub_id,
+            http_session_id: generate_http_session_id(),
             context,
         }
     }
@@ -229,9 +266,9 @@ impl McpListKind {
 
 /// In-memory caller credentials for the live Hub process.
 ///
-/// Tokens live only in this process. Hub shutdown drops them. Session close
-/// revokes the matching token. Re-issue for the same session returns the live
-/// token so env rebuild does not rotate a still-valid caller.
+/// Tokens are restored from the Hub data directory after a restart so a live
+/// agent PTY can keep using `BOTSTER_MCP_TOKEN`. Session close removes the
+/// matching token from memory and from disk. Hub shutdown clears memory only.
 #[derive(Clone, Debug)]
 pub struct McpCallerRegistry {
     inner: Arc<Mutex<CallerState>>,
@@ -240,8 +277,29 @@ pub struct McpCallerRegistry {
 #[derive(Default)]
 struct CallerState {
     url: Option<String>,
+    persist_path: Option<PathBuf>,
+    listen_port: Option<u16>,
     by_token: HashMap<String, McpCaller>,
     by_session: HashMap<String, String>,
+}
+
+/// Disk snapshot so a Hub restart can reuse the listen port and tokens.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct McpCallerSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default)]
+    callers: Vec<PersistedCaller>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCaller {
+    session_uuid: String,
+    hub_id: String,
+    token: String,
+    http_session_id: String,
 }
 
 impl std::fmt::Debug for CallerState {
@@ -268,12 +326,70 @@ impl McpCallerRegistry {
         }
     }
 
-    /// Publish the shared listener URL that later `issue` calls return.
-    pub fn set_url(&self, url: impl Into<String>) {
+    /// Persist caller tokens under this Hub-owned path.
+    ///
+    /// This does not write. Call [`Self::restore_from_disk`] next, then
+    /// [`Self::set_url`], so a restore is not overwritten by an empty snapshot.
+    pub fn set_persist_path(&self, path: impl Into<PathBuf>) {
         self.inner
             .lock()
             .expect("McpCallerRegistry mutex poisoned")
-            .url = Some(url.into());
+            .persist_path = Some(path.into());
+    }
+
+    /// Restore tokens and the last listen port from disk.
+    pub fn restore_from_disk(&self) {
+        let path = {
+            let state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+            state.persist_path.clone()
+        };
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(snapshot) = serde_json::from_slice::<McpCallerSnapshot>(&bytes) else {
+            log::warn!("[mcp-http] ignoring unreadable caller snapshot");
+            return;
+        };
+        let mut state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+        state.listen_port = snapshot
+            .port
+            .or_else(|| port_from_url(snapshot.url.as_deref()));
+        state.by_token.clear();
+        state.by_session.clear();
+        for entry in snapshot.callers {
+            if !entry.token.starts_with(CALLER_TOKEN_PREFIX) {
+                continue;
+            }
+            let mut caller = McpCaller::new(entry.session_uuid.clone(), entry.hub_id);
+            caller.http_session_id = entry.http_session_id;
+            state
+                .by_session
+                .insert(entry.session_uuid, entry.token.clone());
+            state.by_token.insert(entry.token, caller);
+        }
+    }
+
+    /// Last persisted loopback port, if any.
+    #[must_use]
+    pub fn preferred_port(&self) -> Option<u16> {
+        self.inner
+            .lock()
+            .expect("McpCallerRegistry mutex poisoned")
+            .listen_port
+    }
+
+    /// Publish the shared listener URL that later `issue` calls return.
+    pub fn set_url(&self, url: impl Into<String>) {
+        let url = url.into();
+        let port = port_from_url(Some(&url));
+        let mut state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+        state.url = Some(url);
+        state.listen_port = port.or(state.listen_port);
+        drop(state);
+        self.persist();
     }
 
     /// Return the published shared URL, if the listener is up.
@@ -310,6 +426,8 @@ impl McpCallerRegistry {
             .by_session
             .insert(caller.session_uuid.clone(), token.clone());
         state.by_token.insert(token.clone(), caller);
+        drop(state);
+        self.persist();
         Ok(IssuedMcpCaller {
             url,
             token: CallerToken::new(token),
@@ -333,14 +451,58 @@ impl McpCallerRegistry {
         if let Some(token) = state.by_session.remove(session_uuid) {
             state.by_token.remove(&token);
         }
+        drop(state);
+        self.persist();
     }
 
-    /// Drop every credential. Used on Hub shutdown.
-    pub fn revoke_all(&self) {
+    /// Drop in-memory credentials. Persist stays so a Hub restart can restore.
+    pub fn clear_live(&self) {
         let mut state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
         state.by_token.clear();
         state.by_session.clear();
         state.url = None;
+    }
+
+    /// Drop every in-memory credential. Used on Hub shutdown.
+    pub fn revoke_all(&self) {
+        self.clear_live();
+    }
+
+    fn persist(&self) {
+        let state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+        let Some(path) = state.persist_path.clone() else {
+            return;
+        };
+        let snapshot = McpCallerSnapshot {
+            port: state.listen_port,
+            url: state.url.clone(),
+            callers: state
+                .by_session
+                .iter()
+                .filter_map(|(session_uuid, token)| {
+                    let caller = state.by_token.get(token)?;
+                    Some(PersistedCaller {
+                        session_uuid: session_uuid.clone(),
+                        hub_id: caller.hub_id.clone(),
+                        token: token.clone(),
+                        http_session_id: caller.http_session_id.clone(),
+                    })
+                })
+                .collect(),
+        };
+        drop(state);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                log::warn!("[mcp-http] create caller snapshot dir: {error}");
+                return;
+            }
+        }
+        let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) else {
+            return;
+        };
+        if let Err(error) = write_private_file(&path, &bytes) {
+            log::warn!("[mcp-http] write caller snapshot: {error}");
+        }
     }
 
     /// Number of live caller credentials.
@@ -450,7 +612,7 @@ pub(crate) async fn bind_listener(
     fanout: McpHttpFanout,
     dispatch: McpHttpDispatch,
 ) -> Result<McpHttpListener> {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = bind_loopback(callers.preferred_port())
         .await
         .context("bind shared MCP HTTP listener")?;
     let addr = listener
@@ -463,6 +625,7 @@ pub(crate) async fn bind_listener(
         callers,
         fanout,
         dispatch,
+        auth_gate: AuthGate::default(),
     });
 
     tokio::spawn(async move {
@@ -497,12 +660,43 @@ struct HttpState {
     callers: McpCallerRegistry,
     fanout: McpHttpFanout,
     dispatch: McpHttpDispatch,
+    auth_gate: AuthGate,
+}
+
+struct AuthGate {
+    inner: Mutex<(u32, Instant)>,
+}
+
+impl Default for AuthGate {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new((0, Instant::now())),
+        }
+    }
+}
+
+impl AuthGate {
+    fn allow(&self) -> bool {
+        let mut state = self.inner.lock().expect("AuthGate mutex poisoned");
+        if state.1.elapsed() > AUTH_FAIL_WINDOW {
+            *state = (0, Instant::now());
+        }
+        state.0 < AUTH_FAIL_LIMIT
+    }
+
+    fn record_failure(&self) {
+        let mut state = self.inner.lock().expect("AuthGate mutex poisoned");
+        if state.1.elapsed() > AUTH_FAIL_WINDOW {
+            *state = (0, Instant::now());
+        }
+        state.0 = state.0.saturating_add(1);
+    }
 }
 
 async fn handle_request(
     state: Arc<HttpState>,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<McpHttpBody>, Infallible> {
     Ok(match handle_request_inner(&state, request).await {
         Ok(response) => response,
         Err(response) => response,
@@ -512,35 +706,60 @@ async fn handle_request(
 async fn handle_request_inner(
     state: &HttpState,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
     if request.uri().path() != MCP_HTTP_PATH {
         return Err(http_error(StatusCode::NOT_FOUND, "not found"));
     }
+    if !origin_allowed(request.headers()) {
+        return Err(http_error(StatusCode::FORBIDDEN, "invalid Origin"));
+    }
+    if !state.auth_gate.allow() {
+        return Err(http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed caller credentials",
+        ));
+    }
 
     let Some(token) = extract_bearer(request.headers()) else {
+        state.auth_gate.record_failure();
         return Err(http_error(
             StatusCode::UNAUTHORIZED,
             "missing or invalid caller credential",
         ));
     };
     let Some(caller) = state.callers.authorize(&token) else {
+        state.auth_gate.record_failure();
         return Err(http_error(
             StatusCode::UNAUTHORIZED,
             "stale or unknown caller credential",
         ));
     };
+    if let Some(sent) = request
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        if sent != caller.http_session_id {
+            return Err(http_error(StatusCode::NOT_FOUND, "unknown MCP session"));
+        }
+    }
 
-    match *request.method() {
+    let session_id = caller.http_session_id.clone();
+    let response = match *request.method() {
         Method::POST => handle_post(state, caller, request).await,
         Method::GET => handle_sse_get(state, request),
         Method::DELETE => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
-            .body(Full::new(Bytes::new()))
+            .body(empty_body())
             .expect("empty response")),
         _ => Err(http_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
         )),
+    };
+    match response {
+        Ok(response) => Ok(with_session_header(response, &session_id)),
+        Err(response) => Err(with_session_header(response, &session_id)),
     }
 }
 
@@ -548,7 +767,7 @@ async fn handle_post(
     state: &HttpState,
     caller: McpCaller,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
     let body = Limited::new(request.into_body(), BODY_LIMIT)
         .collect()
         .await
@@ -557,8 +776,37 @@ async fn handle_post(
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|_| http_error(StatusCode::BAD_REQUEST, "invalid JSON-RPC body"))?;
 
+    if let Some(batch) = payload.as_array() {
+        let mut replies = Vec::new();
+        for item in batch {
+            match process_rpc(state, caller.clone(), item).await {
+                Ok(Some(value)) | Err(value) => replies.push(value),
+                Ok(None) => {}
+            }
+        }
+        if replies.is_empty() {
+            return Ok(empty_accepted());
+        }
+        return Ok(json_response(Value::Array(replies)));
+    }
+
+    match process_rpc(state, caller, &payload).await {
+        Ok(Some(value)) | Err(value) => Ok(json_response(value)),
+        Ok(None) => Ok(empty_accepted()),
+    }
+}
+
+async fn process_rpc(
+    state: &HttpState,
+    caller: McpCaller,
+    payload: &Value,
+) -> Result<Option<Value>, Value> {
     if payload.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(jsonrpc_error(None, -32600, "invalid JSON-RPC version"));
+        return Err(jsonrpc_object(
+            None,
+            None,
+            Some(json!({ "code": -32600, "message": "invalid JSON-RPC version" })),
+        ));
     }
 
     let id = payload.get("id").cloned();
@@ -567,18 +815,26 @@ async fn handle_post(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if method.is_empty() {
-        return Err(jsonrpc_error(id, -32600, "missing method"));
+        return Err(jsonrpc_object(
+            id,
+            None,
+            Some(json!({ "code": -32600, "message": "missing method" })),
+        ));
     }
     if id.is_none() {
-        return Ok(empty_accepted());
+        return Ok(None);
     }
 
     let params = payload.get("params").cloned().unwrap_or(json!({}));
     if method == "initialize" {
-        return Ok(jsonrpc_result(id, initialize_result()));
+        return Ok(Some(jsonrpc_object(
+            id,
+            Some(initialize_result(&params)),
+            None,
+        )));
     }
     if method == "ping" {
-        return Ok(jsonrpc_result(id, json!({})));
+        return Ok(Some(jsonrpc_object(id, Some(json!({})), None)));
     }
 
     let reply = dispatch_method(state, caller, method, params).await;
@@ -586,19 +842,27 @@ async fn handle_post(
         Ok(McpHttpReply {
             result: Some(result),
             ..
-        }) => Ok(jsonrpc_result(id, result)),
+        }) => Ok(Some(jsonrpc_object(id, Some(result), None))),
         Ok(McpHttpReply {
             error: Some(error), ..
-        }) => Ok(jsonrpc_error_object(id, error)),
-        Ok(_) => Err(jsonrpc_error(id, -32603, "empty MCP reply")),
-        Err(message) => Err(jsonrpc_error(id, -32603, &message)),
+        }) => Ok(Some(jsonrpc_object(id, None, Some(error)))),
+        Ok(_) => Err(jsonrpc_object(
+            id,
+            None,
+            Some(json!({ "code": -32603, "message": "empty MCP reply" })),
+        )),
+        Err(message) => Err(jsonrpc_object(
+            id,
+            None,
+            Some(json!({ "code": -32603, "message": message })),
+        )),
     }
 }
 
 fn handle_sse_get(
     state: &HttpState,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
     let accept = request
         .headers()
         .get(hyper::header::ACCEPT)
@@ -611,16 +875,25 @@ fn handle_sse_get(
         ));
     }
 
-    let mut rx = state.fanout.subscribe();
-    let mut body = String::from("event: endpoint\ndata: /mcp\n\n");
-    while let Ok(kind) = rx.try_recv() {
-        body.push_str(&sse_notification(kind));
-    }
+    let rx = state.fanout.subscribe();
+    let header = stream::once(async {
+        Ok::<_, Infallible>(Frame::data(Bytes::from("event: endpoint\ndata: /mcp\n\n")))
+    });
+    let events = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|kind| {
+            (
+                Ok::<_, Infallible>(Frame::data(Bytes::from(sse_notification(kind)))),
+                rx,
+            )
+        })
+    });
+    let body = StreamBody::new(header.chain(events)).boxed_unsync();
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/event-stream")
         .header("Cache-Control", "no-cache")
-        .body(Full::new(Bytes::from(body)))
+        .header("Connection", "keep-alive")
+        .body(body)
         .map_err(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR, "sse response failed"))
 }
 
@@ -645,13 +918,12 @@ async fn dispatch_method(
                     reply: McpHttpReplyTx(tx),
                 })
                 .map_err(|_| "hub event loop is not accepting MCP requests".to_string())?;
-            let timeout = if method.starts_with("tools/call")
-                || method == "prompts/get"
-                || method == "resources/read"
-            {
-                HUB_DISPATCH_TIMEOUT
-            } else {
-                HUB_QUICK_TIMEOUT
+            let timeout = match method {
+                "tools/call" | "prompts/get" | "resources/read" => HUB_DISPATCH_TIMEOUT,
+                "tools/list" | "prompts/list" | "resources/list" | "resources/templates/list" => {
+                    HUB_LIST_TIMEOUT
+                }
+                _ => HUB_QUICK_TIMEOUT,
             };
             tokio::time::timeout(timeout, rx)
                 .await
@@ -680,6 +952,78 @@ fn generate_caller_token() -> String {
     format!("{CALLER_TOKEN_PREFIX}{}", encode_hex(&bytes))
 }
 
+fn generate_http_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("mcpsess_{}", encode_hex(&bytes))
+}
+
+async fn bind_loopback(preferred: Option<u16>) -> Result<TcpListener> {
+    if let Some(port) = preferred.filter(|port| *port > 0) {
+        // Retry so a Hub restart can reclaim the port after the old listener
+        // closes. macOS can keep the address busy for a short TIME_WAIT.
+        for attempt in 0..8 {
+            match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await {
+                Ok(listener) => return Ok(listener),
+                Err(error) if attempt == 7 => {
+                    log::warn!("[mcp-http] preferred port {port} unavailable: {error}");
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(25 * (attempt + 1) as u64)).await;
+                }
+            }
+        }
+    }
+    TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .context("bind shared MCP HTTP listener on an ephemeral port")
+}
+
+fn port_from_url(url: Option<&str>) -> Option<u16> {
+    let url = url?;
+    let host = url.strip_prefix("http://")?;
+    let host = host.split('/').next()?;
+    host.rsplit_once(':')?.1.parse().ok()
+}
+
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    matches_loopback_origin(origin)
+}
+
+fn matches_loopback_origin(origin: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "http://127.0.0.1",
+        "http://localhost",
+        "http://[::1]",
+        "https://127.0.0.1",
+        "https://localhost",
+        "https://[::1]",
+    ];
+    HOSTS.iter().any(|host| {
+        origin.eq_ignore_ascii_case(host)
+            || origin.to_ascii_lowercase().starts_with(&format!("{host}:"))
+    })
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -690,9 +1034,18 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(params: &Value) -> Value {
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        DEFAULT_PROTOCOL_VERSION
+    };
     json!({
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": { "listChanged": true },
             "prompts": { "listChanged": true },
@@ -715,49 +1068,62 @@ fn sse_notification(kind: McpListKind) -> String {
     )
 }
 
-fn empty_accepted() -> Response<Full<Bytes>> {
+fn empty_body() -> McpHttpBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn full_body(bytes: impl Into<Bytes>) -> McpHttpBody {
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn empty_accepted() -> Response<McpHttpBody> {
     Response::builder()
         .status(StatusCode::ACCEPTED)
-        .body(Full::new(Bytes::new()))
+        .body(empty_body())
         .expect("empty accepted response")
 }
 
-fn http_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn http_error(status: StatusCode, message: &str) -> Response<McpHttpBody> {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(
-            json!({ "error": message }).to_string(),
-        )))
+        .body(full_body(json!({ "error": message }).to_string()))
         .expect("error response")
 }
 
-fn jsonrpc_result(id: Option<Value>, result: Value) -> Response<Full<Bytes>> {
-    json_response(json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(Value::Null),
-        "result": result
-    }))
+fn jsonrpc_object(id: Option<Value>, result: Option<Value>, error: Option<Value>) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("jsonrpc".to_string(), json!("2.0"));
+    object.insert("id".to_string(), id.unwrap_or(Value::Null));
+    if let Some(result) = result {
+        object.insert("result".to_string(), result);
+    }
+    if let Some(error) = error {
+        object.insert("error".to_string(), error);
+    }
+    Value::Object(object)
 }
 
-fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> Response<Full<Bytes>> {
-    jsonrpc_error_object(id, json!({ "code": code, "message": message }))
-}
-
-fn jsonrpc_error_object(id: Option<Value>, error: Value) -> Response<Full<Bytes>> {
-    json_response(json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(Value::Null),
-        "error": error
-    }))
-}
-
-fn json_response(value: Value) -> Response<Full<Bytes>> {
+fn json_response(value: Value) -> Response<McpHttpBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(Full::new(Bytes::from(value.to_string())))
+        .body(full_body(value.to_string()))
         .expect("json response")
+}
+
+fn with_session_header(
+    mut response: Response<McpHttpBody>,
+    session_id: &str,
+) -> Response<McpHttpBody> {
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        response.headers_mut().insert("mcp-session-id", value);
+    }
+    response
 }
 
 /// Dispatch an authorized MCP method through Lua `lib.mcp`.
@@ -790,11 +1156,12 @@ fn dispatch_lua_mcp_inner(
     let mcp: mlua::Table = require
         .call("lib.mcp")
         .map_err(|e| anyhow!("require lib.mcp: {e}"))?;
+    let context_map =
+        lookup_caller_context(lua, &caller.session_uuid).unwrap_or_else(|_| caller.lua_context());
     let context = crate::lua::primitives::json::json_to_lua(
         lua,
         &Value::Object(
-            caller
-                .lua_context()
+            context_map
                 .into_iter()
                 .map(|(k, v)| (k, Value::String(v)))
                 .collect(),
@@ -855,7 +1222,7 @@ fn dispatch_lua_mcp_inner(
                 .get("list_prompts")
                 .map_err(|e| anyhow!("mcp.list_prompts: {e}"))?;
             let prompts: mlua::Value = list
-                .call(())
+                .call(caller.session_uuid.as_str())
                 .map_err(|e| anyhow!("mcp.list_prompts: {e}"))?;
             complete_result(lua, reply, json!({ "prompts": lua_to_json(lua, prompts)? }));
         }
@@ -870,7 +1237,7 @@ fn dispatch_lua_mcp_inner(
             let get_prompt: mlua::Function = mcp
                 .get("get_prompt")
                 .map_err(|e| anyhow!("mcp.get_prompt: {e}"))?;
-            match get_prompt.call::<(mlua::Value, mlua::Value)>((name, args)) {
+            match get_prompt.call::<(mlua::Value, mlua::Value)>((name, args, context.clone())) {
                 Ok((result, err)) => {
                     if let Some(message) = err_string(&err) {
                         let _ = reply.0.send(McpHttpReply::error(-32000, message));
@@ -890,7 +1257,7 @@ fn dispatch_lua_mcp_inner(
                 .get("list_resource_templates")
                 .map_err(|e| anyhow!("mcp.list_resource_templates: {e}"))?;
             let templates: mlua::Value = list
-                .call(())
+                .call(caller.session_uuid.as_str())
                 .map_err(|e| anyhow!("mcp.list_resource_templates: {e}"))?;
             complete_result(
                 lua,
@@ -936,6 +1303,34 @@ fn dispatch_lua_mcp_inner(
         }
     }
     Ok(())
+}
+
+fn lookup_caller_context(
+    lua: &mlua::Lua,
+    session_uuid: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let require: mlua::Function = lua
+        .globals()
+        .get("require")
+        .map_err(|e| anyhow!("require is not available: {e}"))?;
+    let mcp: mlua::Table = require
+        .call("lib.mcp")
+        .map_err(|e| anyhow!("require lib.mcp: {e}"))?;
+    let caller_context: mlua::Function = mcp
+        .get("caller_context")
+        .map_err(|e| anyhow!("mcp.caller_context: {e}"))?;
+    let table: mlua::Table = caller_context
+        .call(session_uuid)
+        .map_err(|e| anyhow!("mcp.caller_context: {e}"))?;
+    let mut ctx = std::collections::BTreeMap::new();
+    for pair in table.pairs::<String, String>() {
+        let (key, value) = pair.map_err(|e| anyhow!("caller context pair: {e}"))?;
+        if !value.is_empty() {
+            ctx.insert(key, value);
+        }
+    }
+    ctx.insert("session_uuid".to_string(), session_uuid.to_string());
+    Ok(ctx)
 }
 
 fn complete_result(lua: &mlua::Lua, reply: McpHttpReplyTx, value: Value) {
@@ -1035,10 +1430,39 @@ pub fn register_lua(
     Ok(())
 }
 
+/// Resolve the shared HTTP URL and caller token for `botster mcp-serve`.
+///
+/// Prefers live environment values. If `BOTSTER_MCP_URL` is missing or stale,
+/// the Hub manifest `mcp_url` is used. The caller token still comes from env
+/// because persist restores that same secret after a Hub restart.
+#[must_use]
+pub fn resolve_stdio_proxy_target() -> Option<(String, String)> {
+    let token = std::env::var(BOTSTER_MCP_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let env_url = std::env::var(BOTSTER_MCP_URL_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let url = env_url.or_else(read_manifest_mcp_url)?;
+    Some((url, token))
+}
+
+fn read_manifest_mcp_url() -> Option<String> {
+    let path = std::env::var("BOTSTER_HUB_MANIFEST_PATH").ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("mcp_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
 /// Run a stdio JSON-RPC proxy to the shared HTTP server.
 ///
 /// This is the short migration path for clients that still launch
-/// `botster mcp-serve`. New clients should use `BOTSTER_MCP_URL` directly.
+/// `botster mcp-serve`. Removal target: [`SOCKET_MCP_FALLBACK_REMOVAL`].
+/// New clients should use `BOTSTER_MCP_URL` directly.
 ///
 /// # Errors
 ///
@@ -1050,36 +1474,81 @@ pub fn run_stdio_proxy(url: &str, token: &str) -> Result<()> {
 
 async fn run_stdio_proxy_async(url: &str, token: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::task::JoinSet;
 
     let client = reqwest::Client::new();
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+    let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+    let url = Arc::new(url.to_string());
+    let token = Arc::new(token.to_string());
+    let mut tasks = JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let response = client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(line)
-            .send()
-            .await
-            .with_context(|| format!("proxy MCP POST to {url}"))?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() && body.trim().is_empty() {
-            anyhow::bail!("shared MCP HTTP proxy received HTTP {status}");
-        }
-        stdout.write_all(body.as_bytes()).await?;
-        if !body.ends_with('\n') {
-            stdout.write_all(b"\n").await?;
-        }
-        stdout.flush().await?;
+        let client = client.clone();
+        let stdout = Arc::clone(&stdout);
+        let url = Arc::clone(&url);
+        let token = Arc::clone(&token);
+        tasks.spawn(async move {
+            let body = proxy_http_line(&client, &url, &token, line).await?;
+            let mut out = stdout.lock().await;
+            out.write_all(body.as_bytes()).await?;
+            if !body.ends_with('\n') {
+                out.write_all(b"\n").await?;
+            }
+            out.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        joined.context("stdio MCP proxy task")??;
     }
     Ok(())
+}
+
+async fn proxy_http_line(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    line: String,
+) -> Result<String> {
+    match post_mcp_line(client, url, token, &line).await {
+        Ok(body) => Ok(body),
+        Err(_) => {
+            let retry_url = read_manifest_mcp_url().unwrap_or_else(|| url.to_string());
+            post_mcp_line(client, &retry_url, token, &line)
+                .await
+                .with_context(|| format!("proxy MCP POST to {retry_url}"))
+        }
+    }
+}
+
+async fn post_mcp_line(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    line: &str,
+) -> Result<String> {
+    let response = client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(line.to_string())
+        .send()
+        .await
+        .with_context(|| format!("proxy MCP POST to {url}"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == StatusCode::UNAUTHORIZED {
+        anyhow::bail!("shared MCP HTTP proxy received HTTP {status}");
+    }
+    if !status.is_success() && body.trim().is_empty() {
+        anyhow::bail!("shared MCP HTTP proxy received HTTP {status}");
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -1301,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_reuses_the_same_caller_credential() {
+    fn sequential_posts_reuse_the_same_caller_credential() {
         test_runtime().block_on(async {
             let (callers, _fanout, listener) = start_server().await;
             let issued = callers
@@ -1328,6 +1797,48 @@ mod tests {
                 first["result"]["tools"][0]["name"],
                 second["result"]["tools"][0]["name"]
             );
+        });
+    }
+
+    #[test]
+    fn hub_restart_restores_port_and_caller_token() {
+        test_runtime().block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("mcp_callers.json");
+            let callers = McpCallerRegistry::new();
+            callers.set_persist_path(&path);
+            let fanout = McpHttpFanout::new();
+            let mut listener = bind_listener(callers.clone(), fanout.clone(), scoped_dispatcher())
+                .await
+                .expect("bind");
+            let issued = callers
+                .issue(McpCaller::new("sess-recover", "hub-1"))
+                .expect("issue");
+            let url = listener.url().to_string();
+            let token = issued.token.as_str().to_string();
+            let (_, ok) = rpc(&url, Some(&token), 1, "initialize", json!({})).await;
+            assert!(ok.get("result").is_some());
+
+            listener.shutdown();
+            drop(listener);
+            callers.clear_live();
+            assert!(callers.authorize(&token).is_none());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let restored = McpCallerRegistry::new();
+            restored.set_persist_path(&path);
+            restored.restore_from_disk();
+            assert_eq!(restored.preferred_port(), port_from_url(Some(&url)));
+            let _listener = bind_listener(restored.clone(), fanout, scoped_dispatcher())
+                .await
+                .expect("rebind");
+            assert_eq!(restored.url().as_deref(), Some(url.as_str()));
+            assert_eq!(
+                restored.authorize(&token).expect("restored").session_uuid,
+                "sess-recover"
+            );
+            let (_, again) = rpc(&url, Some(&token), 2, "tools/list", json!({})).await;
+            assert_eq!(again["result"]["tools"][0]["name"], "whoami_sess-recover");
         });
     }
 
@@ -1382,6 +1893,7 @@ mod tests {
         assert!(config.contains("\"type\": \"http\""));
         assert!(!config.contains("mcp-serve"));
         assert!(!config.contains("BOTSTER_SESSION_UUID"));
+        assert_eq!(SOCKET_MCP_FALLBACK_REMOVAL, "2026-10-01");
     }
 
     #[test]
@@ -1418,5 +1930,312 @@ mod tests {
         assert!(!tools.contains("session_uuid"));
         assert!(!tools.contains("hub_id"));
         assert!(!tools.contains("btcaller_"));
+    }
+
+    #[test]
+    fn sse_get_holds_and_delivers_list_changed() {
+        test_runtime().block_on(async {
+            let (callers, fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-sse", "hub-1"))
+                .expect("issue");
+            let url = listener.url().to_string();
+            let token = issued.token.as_str().to_string();
+            let host = url
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split('/').next())
+                .expect("listen host");
+            let notify = fanout.clone();
+            let token_for_get = token.clone();
+            let host_for_get = host.to_string();
+            let join = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = tokio::net::TcpStream::connect(&host_for_get)
+                    .await
+                    .expect("sse connect");
+                let request = format!(
+                    "GET /mcp HTTP/1.1\r\nHost: {host_for_get}\r\nAuthorization: Bearer {token_for_get}\r\nAccept: text/event-stream\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.expect("sse write");
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                notify.notify(McpListKind::Tools);
+                let mut body = String::new();
+                let mut buf = [0u8; 2048];
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < deadline {
+                    match tokio::time::timeout(Duration::from_millis(400), stream.read(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            body.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if body.contains("notifications/tools/list_changed") {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                body
+            });
+            let body = join.await.expect("sse task");
+            assert!(
+                body.contains("event: endpoint"),
+                "SSE must start with the endpoint event: {body}"
+            );
+            assert!(
+                body.contains("notifications/tools/list_changed"),
+                "held SSE must deliver list_changed: {body}"
+            );
+            assert!(!body.contains("sess-sse"));
+        });
+    }
+
+    #[test]
+    fn foreign_origin_is_rejected() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-origin", "hub-1"))
+                .expect("issue");
+            let response = reqwest::Client::new()
+                .post(listener.url())
+                .header(AUTHORIZATION, format!("Bearer {}", issued.token.as_str()))
+                .header(ORIGIN, "https://evil.example")
+                .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+                .send()
+                .await
+                .expect("origin post");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        });
+    }
+
+    #[test]
+    fn initialize_echoes_supported_protocol_version_and_batch() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-proto", "hub-1"))
+                .expect("issue");
+            let (_, body) = rpc(
+                listener.url(),
+                Some(issued.token.as_str()),
+                1,
+                "initialize",
+                json!({ "protocolVersion": "2025-06-18" }),
+            )
+            .await;
+            assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+
+            let response = reqwest::Client::new()
+                .post(listener.url())
+                .header(AUTHORIZATION, format!("Bearer {}", issued.token.as_str()))
+                .json(&json!([
+                    {"jsonrpc":"2.0","id":2,"method":"ping","params":{}},
+                    {"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}
+                ]))
+                .send()
+                .await
+                .expect("batch");
+            let batch = response.json::<Value>().await.expect("batch json");
+            assert!(batch.is_array());
+            assert_eq!(batch[0]["result"], json!({}));
+            assert_eq!(batch[1]["result"]["protocolVersion"], "2024-11-05");
+        });
+    }
+
+    fn install_mcp_stub(lua: &mlua::Lua) {
+        lua.load(
+            r#"
+            package.preload["lib.mcp"] = function()
+                return {
+                    caller_context = function(session)
+                        return {
+                            session_uuid = session,
+                            session_name = "from-manifest",
+                            branch_name = "main",
+                            repo = "org/repo",
+                            worktree_path = "/tmp/wt",
+                            workspace_id = "ws-1",
+                            agent_name = "agent",
+                            hub_id = "device-hub",
+                        }
+                    end,
+                    list_tools = function(session)
+                        return {{
+                            name = "whoami_" .. session,
+                            description = "t",
+                            input_schema = { type = "object" },
+                        }}
+                    end,
+                    call_tool = function(_, _, context, cb)
+                        cb({
+                            {
+                                type = "text",
+                                text = table.concat({
+                                    context.session_name,
+                                    context.repo,
+                                    context.branch_name,
+                                    context.worktree_path,
+                                }, "|"),
+                            },
+                        }, nil, false)
+                    end,
+                    list_prompts = function(session)
+                        return {{ name = "prompt_" .. session }}
+                    end,
+                    get_prompt = function(name, _, context)
+                        if name ~= "prompt_" .. context.session_uuid then
+                            return nil, "Prompt not available for this session: " .. name
+                        end
+                        return { description = context.session_name, messages = {} }, nil
+                    end,
+                    list_resource_templates = function(session)
+                        return {{ uriTemplate = "botster://" .. session }}
+                    end,
+                    read_resource = function(uri, context, cb)
+                        cb({{ uri = uri, text = context.repo }}, nil)
+                    end,
+                }
+            end
+            "#,
+        )
+        .exec()
+        .expect("stub lib.mcp");
+    }
+
+    fn dispatch_reply(lua: &mlua::Lua, caller: &McpCaller, method: &str, params: Value) -> Value {
+        let (tx, rx) = oneshot::channel();
+        dispatch_lua_mcp(lua, caller, method, params, McpHttpReplyTx(tx));
+        let reply = rx.blocking_recv().expect("dispatch reply");
+        reply
+            .result
+            .unwrap_or_else(|| reply.error.unwrap_or(json!({})))
+    }
+
+    #[test]
+    fn dispatch_lua_mcp_rebuilds_manifest_context_and_scopes_prompts() {
+        let lua = mlua::Lua::new();
+        install_mcp_stub(&lua);
+        let alice = McpCaller::new("sess-alice", "hub-stale");
+        let tools = dispatch_reply(&lua, &alice, "tools/list", json!({}));
+        assert_eq!(tools["tools"][0]["name"], "whoami_sess-alice");
+
+        let called = dispatch_reply(
+            &lua,
+            &alice,
+            "tools/call",
+            json!({ "name": "whoami_sess-alice", "arguments": {} }),
+        );
+        let text = called["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "from-manifest|org/repo|main|/tmp/wt");
+
+        let prompts = dispatch_reply(&lua, &alice, "prompts/list", json!({}));
+        assert_eq!(prompts["prompts"][0]["name"], "prompt_sess-alice");
+        assert!(!prompts.to_string().contains("sess-bob"));
+
+        let stolen = dispatch_reply(
+            &lua,
+            &alice,
+            "prompts/get",
+            json!({ "name": "prompt_sess-bob", "arguments": {} }),
+        );
+        assert!(
+            stolen["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not available"),
+            "alice must not get bob's prompt: {stolen}"
+        );
+
+        let own = dispatch_reply(
+            &lua,
+            &alice,
+            "prompts/get",
+            json!({ "name": "prompt_sess-alice", "arguments": {} }),
+        );
+        assert_eq!(own["description"], "from-manifest");
+
+        let templates = dispatch_reply(&lua, &alice, "resources/templates/list", json!({}));
+        assert_eq!(
+            templates["resourceTemplates"][0]["uriTemplate"],
+            "botster://sess-alice"
+        );
+    }
+
+    #[test]
+    fn stdio_proxy_forwards_json_rpc_and_retries_stale_url() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-proxy", "hub-1"))
+                .expect("issue");
+            let client = reqwest::Client::new();
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string();
+            let body =
+                proxy_http_line(&client, listener.url(), issued.token.as_str(), line.clone())
+                    .await
+                    .expect("proxy line");
+            let parsed: Value = serde_json::from_str(&body).expect("proxy json");
+            assert_eq!(parsed["result"]["tools"][0]["name"], "whoami_sess-proxy");
+
+            let first =
+                proxy_http_line(&client, listener.url(), issued.token.as_str(), line.clone());
+            let second = proxy_http_line(&client, listener.url(), issued.token.as_str(), line);
+            let (first, second) = tokio::join!(first, second);
+            assert!(first.expect("first").contains("whoami_sess-proxy"));
+            assert!(second.expect("second").contains("whoami_sess-proxy"));
+        });
+    }
+
+    #[test]
+    fn persist_drops_revoked_session_and_survives_clear_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp_callers.json");
+        let callers = McpCallerRegistry::new();
+        callers.set_persist_path(&path);
+        callers.set_url("http://127.0.0.1:9/mcp");
+        let issued = callers
+            .issue(McpCaller::new("sess-persist", "hub-1"))
+            .expect("issue");
+        callers.revoke_session("sess-persist");
+        callers.clear_live();
+
+        let restored = McpCallerRegistry::new();
+        restored.set_persist_path(&path);
+        restored.restore_from_disk();
+        assert!(restored.authorize(issued.token.as_str()).is_none());
+
+        let live = McpCallerRegistry::new();
+        live.set_persist_path(&path);
+        live.set_url("http://127.0.0.1:9/mcp");
+        let keep = live
+            .issue(McpCaller::new("sess-keep", "hub-1"))
+            .expect("keep");
+        live.clear_live();
+        let again = McpCallerRegistry::new();
+        again.set_persist_path(&path);
+        again.restore_from_disk();
+        assert_eq!(
+            again
+                .authorize(keep.token.as_str())
+                .expect("kept")
+                .session_uuid,
+            "sess-keep"
+        );
+    }
+
+    #[test]
+    fn loopback_origin_helpers() {
+        assert!(matches_loopback_origin("http://127.0.0.1"));
+        assert!(matches_loopback_origin("http://localhost:1234"));
+        assert!(!matches_loopback_origin("https://evil.example"));
+        assert_eq!(port_from_url(Some("http://127.0.0.1:4321/mcp")), Some(4321));
     }
 }

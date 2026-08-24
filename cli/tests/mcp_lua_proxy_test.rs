@@ -308,3 +308,96 @@ fn proxied_tool_call_preserves_remote_error_content_blocks() {
         "proxied MCP tools/call should preserve every remote isError content block"
     );
 }
+
+#[test]
+fn caller_context_uses_live_session_and_scopes_prompts() {
+    let lua = create_lua_vm();
+    let ok: bool = lua
+        .load(
+            r#"
+            package.preload["lib.session"] = function()
+              return {
+                get = function(uuid)
+                  if uuid == "sess-live" then
+                    return {
+                      session_uuid = uuid,
+                      session_name = "live-name",
+                      agent_name = "cursor",
+                      branch_name = "main",
+                      repo = "org/repo",
+                      _workspace_id = "ws-moved",
+                      worktree_path = "/tmp/wt",
+                      target_id = "tgt-1",
+                      target_path = "/tmp/repo",
+                    }
+                  end
+                end,
+              }
+            end
+            package.preload["lib.config_resolver"] = function()
+              return {
+                resolve_all = function()
+                  return {
+                    agents = {
+                      cursor = { manifest = { plugins = { "allowed-plugin" } } },
+                    },
+                  }
+                end,
+              }
+            end
+            _G.config = { data_dir = function() return "/tmp" end }
+            _G.spawn_targets = {
+              get = function()
+                return { plugins = { "allowed-plugin" } }
+              end,
+            }
+            _G.hub.hub_id = function() return "device-hub" end
+            _G.hub.server_id = function() return "cloud-hub" end
+
+            local mcp = require("lib.mcp")
+            _G._loading_plugin_name = "allowed-plugin"
+            mcp.prompt("visible-prompt", { description = "ok" }, function()
+              return "visible"
+            end)
+            mcp.resource("botster://allowed/{id}", { name = "allowed" }, function()
+              return {}
+            end)
+            _G._loading_plugin_name = "secret-plugin"
+            mcp.prompt("hidden-prompt", { description = "no" }, function()
+              return "hidden"
+            end)
+            mcp.resource("botster://secret/{id}", { name = "secret" }, function()
+              return {}
+            end)
+            _G._loading_plugin_name = nil
+
+            local context = mcp.caller_context("sess-live")
+            assert(context.hub_id == "device-hub", "hub_id must match session manifest rule")
+            assert(context.session_name == "live-name")
+            assert(context.workspace_id == "ws-moved")
+            assert(context.repo == "org/repo")
+            assert(context.branch_name == "main")
+            assert(context.worktree_path == "/tmp/wt")
+
+            local prompts = mcp.list_prompts("sess-live")
+            local names = {}
+            for _, prompt in ipairs(prompts) do names[prompt.name] = true end
+            assert(names["visible-prompt"], "allowed prompt must be listed")
+            assert(not names["hidden-prompt"], "other plugin prompt must stay hidden")
+
+            local hidden, err = mcp.get_prompt("hidden-prompt", {}, { session_uuid = "sess-live" })
+            assert(hidden == nil)
+            assert(tostring(err):find("not available", 1, true))
+
+            local templates = mcp.list_resource_templates("sess-live")
+            local uris = {}
+            for _, tmpl in ipairs(templates) do uris[tmpl.uriTemplate] = true end
+            assert(uris["botster://allowed/{id}"])
+            assert(not uris["botster://secret/{id}"])
+            return true
+            "#,
+        )
+        .eval()
+        .expect("caller context and scoped prompts");
+    assert!(ok);
+}

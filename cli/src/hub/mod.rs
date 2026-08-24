@@ -941,11 +941,15 @@ impl Hub {
 
     /// Start the Hub-owned Streamable HTTP MCP listener on loopback.
     ///
-    /// Every session reuses this one listener. Caller credentials stay in
-    /// process memory and are issued when a session builds its environment.
+    /// Every session reuses this one listener. Caller credentials are restored
+    /// from the Hub data directory so a recovered live PTY keeps its token.
     pub(crate) fn start_mcp_http_server(&mut self) {
         if self.mcp_http_listener.is_some() {
             return;
+        }
+        if let Ok(path) = daemon::mcp_callers_path(&self.hub_identifier) {
+            self.mcp_callers.set_persist_path(path);
+            self.mcp_callers.restore_from_disk();
         }
         let _guard = self.tokio_runtime.enter();
         match self.tokio_runtime.block_on(crate::mcp_http::bind_listener(
@@ -958,7 +962,10 @@ impl Hub {
                 self.mcp_http_listener = Some(listener);
             }
             Err(e) => {
-                log::error!("Failed to start shared MCP HTTP listener: {e}");
+                log::error!(
+                    "Failed to start shared MCP HTTP listener: {e}. Sessions will omit BOTSTER_MCP_URL and mcp-serve will use the socket fallback until {}",
+                    crate::mcp_http::SOCKET_MCP_FALLBACK_REMOVAL
+                );
             }
         }
     }
@@ -1143,7 +1150,7 @@ impl Hub {
         if let Some(mut listener) = self.mcp_http_listener.take() {
             listener.shutdown();
         }
-        self.mcp_callers.revoke_all();
+        self.mcp_callers.clear_live();
         // Release singleton lock (flock released on fd close)
         if let Some(lock) = self.singleton_lock.take() {
             log::info!("Released singleton lock: {}", lock.path.display());

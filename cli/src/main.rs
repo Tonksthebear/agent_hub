@@ -1396,15 +1396,11 @@ fn main() -> Result<()> {
             run_attach()?;
         }
         Commands::McpServe => {
-            let url = std::env::var("BOTSTER_MCP_URL")
-                .ok()
-                .filter(|s| !s.is_empty());
-            let token = std::env::var("BOTSTER_MCP_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty());
-            match (url, token) {
-                (Some(url), Some(token)) => botster::mcp_http::run_stdio_proxy(&url, &token)?,
-                _ => match resolve_mcp_serve_socket()? {
+            // HTTP is the durable transport. The socket gateway stays until
+            // SOCKET_MCP_FALLBACK_REMOVAL (2026-10-01).
+            match botster::mcp_http::resolve_stdio_proxy_target() {
+                Some((url, token)) => botster::mcp_http::run_stdio_proxy(&url, &token)?,
+                None => match resolve_mcp_serve_socket()? {
                     Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
                     None => botster::mcp_gateway::run_disconnected(
                         "Botster MCP is available only inside a Botster-managed session",
