@@ -554,8 +554,8 @@ fn hub_prompt_to_mcp(p: &Value) -> Option<Prompt> {
 /// Hub content uses the same MCP wire shape (`{ type: "text", text: "..." }`,
 /// `{ type: "image", data: "...", mimeType: "..." }`, etc.), so we deserialize
 /// directly via serde to preserve all content types — not just text.
-fn hub_content_to_mcp(content: &Value) -> Vec<Content> {
-    serde_json::from_value::<Vec<Content>>(content.clone()).unwrap_or_default()
+fn hub_content_to_mcp(content: &Value) -> Vec<ContentBlock> {
+    serde_json::from_value::<Vec<ContentBlock>>(content.clone()).unwrap_or_default()
 }
 
 /// Convert hub messages array to rmcp `PromptMessage` items.
@@ -572,14 +572,14 @@ fn hub_messages_to_mcp(messages: &Value) -> Vec<PromptMessage> {
 fn hub_resource_template_to_mcp(t: &Value) -> Option<ResourceTemplate> {
     let uri_template = t.get("uriTemplate")?.as_str()?;
     let name = t.get("name")?.as_str()?;
-    let mut raw = RawResourceTemplate::new(uri_template, name);
+    let mut raw = ResourceTemplate::new(uri_template, name);
     if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
         raw = raw.with_description(desc);
     }
     if let Some(mime) = t.get("mimeType").and_then(|m| m.as_str()) {
         raw = raw.with_mime_type(mime);
     }
-    Some(raw.no_annotation())
+    Some(raw)
 }
 
 impl ServerHandler for McpGateway {
@@ -677,13 +677,14 @@ impl ServerHandler for McpGateway {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
         async move {
             if let Some(reason) = &self.disconnected_reason {
                 if request.name.as_ref() == DISCONNECTED_STATUS_TOOL {
-                    return Ok(CallToolResult::success(vec![Content::text(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
                         disconnected_status_message(reason),
-                    )]));
+                    )])
+                    .into());
                 }
 
                 return Err(ErrorData::invalid_params(
@@ -695,7 +696,7 @@ impl ServerHandler for McpGateway {
                 let message =
                     reconnecting_status_message(&self.connection_state.unavailable_message().await);
                 if request.name.as_ref() == DISCONNECTED_STATUS_TOOL {
-                    return Ok(CallToolResult::success(vec![Content::text(message)]));
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(message)]).into());
                 }
 
                 return Err(ErrorData::internal_error(message, None));
@@ -732,7 +733,7 @@ impl ServerHandler for McpGateway {
             if is_error {
                 result.is_error = Some(true);
             }
-            Ok(result)
+            Ok(result.into())
         }
     }
 
@@ -774,7 +775,7 @@ impl ServerHandler for McpGateway {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetPromptResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
         async move {
             if let Some(reason) = &self.disconnected_reason {
                 return Err(ErrorData::invalid_params(reason.clone(), None));
@@ -830,8 +831,16 @@ impl ServerHandler for McpGateway {
                 result = result.with_description(desc);
             }
 
-            Ok(result)
+            Ok(result.into())
         }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(Vec::new())))
     }
 
     fn list_resource_templates(
@@ -877,7 +886,8 @@ impl ServerHandler for McpGateway {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
+    {
         async move {
             if let Some(reason) = &self.disconnected_reason {
                 return Err(ErrorData::resource_not_found(reason.clone(), None));
@@ -950,7 +960,7 @@ impl ServerHandler for McpGateway {
                 })
                 .unwrap_or_default();
 
-            Ok(ReadResourceResult::new(contents))
+            Ok(ReadResourceResult::new(contents).into())
         }
     }
 }

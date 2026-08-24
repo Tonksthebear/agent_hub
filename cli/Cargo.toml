@@ -103,8 +103,9 @@ mdns-sd = "0.18"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
-# MCP SDK — official Rust MCP server implementation (JSON-RPC framing, method dispatch)
-rmcp = { version = "1.1", features = ["transport-io"] }
+# MCP SDK — official Rust MCP server implementation and transports.
+rmcp = { version = "3.1.4", features = ["transport-io", "transport-streamable-http-server"] }
+tower-service = "0.3"
 
 # Process title — sets what shows in `ps`, Activity Monitor, `top` (M-DOCUMENTED-MAGIC)
 proctitle = "0.1"

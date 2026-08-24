@@ -28,21 +28,27 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures_util::{stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full, Limited, StreamBody};
-use hyper::body::{Frame, Incoming};
-use hyper::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, ORIGIN};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use mlua::LuaSerdeExt;
 use rand::RngCore;
+use rmcp::model::*;
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
+use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use tower_service::Service;
 
 use crate::hub::events::{HubEvent, HubEventTx};
 
@@ -97,12 +103,6 @@ const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 /// gateway remain only until this date.
 pub const SOCKET_MCP_FALLBACK_REMOVAL: &str = "2026-10-01";
 
-/// Streamable HTTP protocol versions this listener accepts.
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
-
-/// Default Streamable HTTP protocol version when the client omits one.
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
-
 /// Drop persisted credentials older than this.
 ///
 /// A recovered live PTY reconnects well before two weeks. Tokens for
@@ -155,8 +155,6 @@ pub struct McpCaller {
     pub session_uuid: String,
     /// Hub identity of the authorized caller.
     pub hub_id: String,
-    /// Streamable HTTP session id. This is not a Botster session UUID.
-    pub http_session_id: String,
     /// Unix seconds when this credential was first issued.
     pub issued_at: u64,
     /// Extra caller context from the session, never another caller.
@@ -175,7 +173,6 @@ impl McpCaller {
         Self {
             session_uuid,
             hub_id,
-            http_session_id: generate_http_session_id(),
             issued_at: now_unix(),
             context,
         }
@@ -263,14 +260,6 @@ impl McpListKind {
             _ => None,
         }
     }
-
-    fn notification_method(self) -> &'static str {
-        match self {
-            Self::Tools => "notifications/tools/list_changed",
-            Self::Prompts => "notifications/prompts/list_changed",
-            Self::Resources => "notifications/resources/list_changed",
-        }
-    }
 }
 
 /// In-memory caller credentials for the live Hub process.
@@ -308,7 +297,6 @@ struct PersistedCaller {
     session_uuid: String,
     hub_id: String,
     token: String,
-    http_session_id: String,
     #[serde(default)]
     issued_at: u64,
 }
@@ -378,7 +366,6 @@ impl McpCallerRegistry {
                 continue;
             }
             let mut caller = McpCaller::new(entry.session_uuid.clone(), entry.hub_id);
-            caller.http_session_id = entry.http_session_id;
             caller.issued_at = entry.issued_at;
             state
                 .by_session
@@ -538,7 +525,6 @@ impl McpCallerRegistry {
                         session_uuid: session_uuid.clone(),
                         hub_id: caller.hub_id.clone(),
                         token: token.clone(),
-                        http_session_id: caller.http_session_id.clone(),
                         issued_at: caller.issued_at,
                     })
                 })
@@ -615,7 +601,10 @@ pub(crate) enum McpHttpDispatch {
     /// Production path: enqueue work on the Hub event loop.
     Hub(HubEventTx),
     /// Test path: answer immediately without Lua.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the direct dispatcher supports HTTP unit tests")
+    )]
     Direct(Arc<dyn Fn(McpCaller, String, Value) -> Result<Value, String> + Send + Sync>),
 }
 
@@ -685,6 +674,7 @@ pub(crate) async fn bind_listener(
         fanout,
         dispatch,
         auth_gate: AuthGate::default(),
+        services: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(async move {
@@ -720,6 +710,203 @@ struct HttpState {
     fanout: McpHttpFanout,
     dispatch: McpHttpDispatch,
     auth_gate: AuthGate,
+    services: tokio::sync::Mutex<HashMap<String, CallerHttpService>>,
+}
+
+type CallerHttpService = StreamableHttpService<HttpMcpHandler, LocalSessionManager>;
+
+#[derive(Clone, Debug)]
+struct HttpMcpHandler {
+    caller: McpCaller,
+    fanout: McpHttpFanout,
+    dispatch: McpHttpDispatch,
+}
+
+impl HttpMcpHandler {
+    async fn dispatch<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, ErrorData> {
+        let reply = dispatch_method(&self.dispatch, self.caller.clone(), method, params)
+            .await
+            .map_err(|message| ErrorData::internal_error(message, None))?;
+        if let Some(error) = reply.error {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Hub MCP request failed")
+                .to_string();
+            return Err(ErrorData::internal_error(
+                message,
+                error.get("data").cloned(),
+            ));
+        }
+        let mut value = reply
+            .result
+            .ok_or_else(|| ErrorData::internal_error("Hub returned an empty MCP reply", None))?;
+        if let Some(result) = value.as_object_mut() {
+            result.entry("resultType".to_string()).or_insert_with(|| {
+                serde_json::to_value(ResultType::COMPLETE)
+                    .expect("rmcp complete result type must serialize")
+            });
+            if matches!(
+                method,
+                "tools/list"
+                    | "prompts/list"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            ) {
+                result
+                    .entry("ttlMs".to_string())
+                    .or_insert_with(|| json!(0));
+                result.entry("cacheScope".to_string()).or_insert_with(|| {
+                    serde_json::to_value(CacheScope::Private)
+                        .expect("rmcp private cache scope must serialize")
+                });
+            }
+        }
+        serde_json::from_value(value).map_err(|error| {
+            ErrorData::internal_error(format!("Hub returned an invalid MCP result: {error}"), None)
+        })
+    }
+}
+
+impl ServerHandler for HttpMcpHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_prompts()
+                .enable_prompts_list_changed()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "botster-hub",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    fn on_initialized(
+        &self,
+        context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async move {
+            let mut notifications = self.fanout.subscribe();
+            let peer = context.peer;
+            tokio::spawn(async move {
+                while let Some(kind) = notifications.recv().await {
+                    let result = match kind {
+                        McpListKind::Tools => peer.notify_tool_list_changed().await,
+                        McpListKind::Prompts => peer.notify_prompt_list_changed().await,
+                        McpListKind::Resources => peer.notify_resource_list_changed().await,
+                    };
+                    if let Err(error) = result {
+                        log::debug!("[mcp-http] list change notification ended: {error}");
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        async move {
+            let mut result: Value = self.dispatch("tools/list", json!({})).await?;
+            if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.entry("inputSchema".to_string())
+                            .or_insert_with(|| json!({ "type": "object" }));
+                    }
+                }
+            }
+            serde_json::from_value(result).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Hub returned an invalid tools/list result: {error}"),
+                    None,
+                )
+            })
+        }
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(request).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid tool call: {error}"), None)
+            })?;
+            let result: CallToolResult = self.dispatch("tools/call", params).await?;
+            Ok(result.into())
+        }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
+        self.dispatch("prompts/list", json!({}))
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
+        async move {
+            let params = serde_json::to_value(request).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid prompt request: {error}"), None)
+            })?;
+            let result: GetPromptResult = self.dispatch("prompts/get", params).await?;
+            Ok(result.into())
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(Vec::new())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_
+    {
+        self.dispatch("resources/templates/list", json!({}))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
+    {
+        async move {
+            let params = serde_json::to_value(request).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid resource request: {error}"), None)
+            })?;
+            let result: ReadResourceResult = self.dispatch("resources/read", params).await?;
+            Ok(result.into())
+        }
+    }
 }
 
 struct AuthGate {
@@ -786,176 +973,42 @@ async fn handle_request_inner(
             "stale or unknown caller credential",
         ));
     };
-    if let Some(sent) = request
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-    {
-        if sent != caller.http_session_id {
-            return Err(http_error(StatusCode::NOT_FOUND, "unknown MCP session"));
-        }
-    }
-
-    let session_id = caller.http_session_id.clone();
-    let response = match *request.method() {
-        Method::POST => handle_post(state, caller, request).await,
-        Method::GET => handle_sse_get(state, request),
-        Method::DELETE => Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(empty_body())
-            .expect("empty response")),
-        _ => Err(http_error(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed",
-        )),
+    let mut service = {
+        let mut services = state.services.lock().await;
+        services.retain(|stored_token, _| state.callers.authorize(stored_token).is_some());
+        services
+            .entry(token)
+            .or_insert_with(|| {
+                let handler = HttpMcpHandler {
+                    caller,
+                    fanout: state.fanout.clone(),
+                    dispatch: state.dispatch.clone(),
+                };
+                let mut config = StreamableHttpServerConfig::default();
+                config.max_request_body_bytes = BODY_LIMIT;
+                config.json_response = true;
+                StreamableHttpService::new(
+                    move || Ok(handler.clone()),
+                    Arc::new(LocalSessionManager::default()),
+                    config,
+                )
+            })
+            .clone()
     };
-    match response {
-        Ok(response) => Ok(with_session_header(response, &session_id)),
-        Err(response) => Err(with_session_header(response, &session_id)),
-    }
-}
-
-async fn handle_post(
-    state: &HttpState,
-    caller: McpCaller,
-    request: Request<Incoming>,
-) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
-    let body = Limited::new(request.into_body(), BODY_LIMIT)
-        .collect()
+    let response = Service::call(&mut service, request)
         .await
-        .map_err(|_| http_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?
-        .to_bytes();
-    let payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| http_error(StatusCode::BAD_REQUEST, "invalid JSON-RPC body"))?;
-
-    if let Some(batch) = payload.as_array() {
-        let mut replies = Vec::new();
-        for item in batch {
-            match process_rpc(state, caller.clone(), item).await {
-                Ok(Some(value)) | Err(value) => replies.push(value),
-                Ok(None) => {}
-            }
-        }
-        if replies.is_empty() {
-            return Ok(empty_accepted());
-        }
-        return Ok(json_response(Value::Array(replies)));
-    }
-
-    match process_rpc(state, caller, &payload).await {
-        Ok(Some(value)) | Err(value) => Ok(json_response(value)),
-        Ok(None) => Ok(empty_accepted()),
-    }
-}
-
-async fn process_rpc(
-    state: &HttpState,
-    caller: McpCaller,
-    payload: &Value,
-) -> Result<Option<Value>, Value> {
-    if payload.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(jsonrpc_object(
-            None,
-            None,
-            Some(json!({ "code": -32600, "message": "invalid JSON-RPC version" })),
-        ));
-    }
-
-    let id = payload.get("id").cloned();
-    let method = payload
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if method.is_empty() {
-        return Err(jsonrpc_object(
-            id,
-            None,
-            Some(json!({ "code": -32600, "message": "missing method" })),
-        ));
-    }
-    if id.is_none() {
-        return Ok(None);
-    }
-
-    let params = payload.get("params").cloned().unwrap_or(json!({}));
-    if method == "initialize" {
-        return Ok(Some(jsonrpc_object(
-            id,
-            Some(initialize_result(&params)),
-            None,
-        )));
-    }
-    if method == "ping" {
-        return Ok(Some(jsonrpc_object(id, Some(json!({})), None)));
-    }
-
-    let reply = dispatch_method(state, caller, method, params).await;
-    match reply {
-        Ok(McpHttpReply {
-            result: Some(result),
-            ..
-        }) => Ok(Some(jsonrpc_object(id, Some(result), None))),
-        Ok(McpHttpReply {
-            error: Some(error), ..
-        }) => Ok(Some(jsonrpc_object(id, None, Some(error)))),
-        Ok(_) => Err(jsonrpc_object(
-            id,
-            None,
-            Some(json!({ "code": -32603, "message": "empty MCP reply" })),
-        )),
-        Err(message) => Err(jsonrpc_object(
-            id,
-            None,
-            Some(json!({ "code": -32603, "message": message })),
-        )),
-    }
-}
-
-fn handle_sse_get(
-    state: &HttpState,
-    request: Request<Incoming>,
-) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
-    let accept = request
-        .headers()
-        .get(hyper::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !accept.contains("text/event-stream") {
-        return Err(http_error(
-            StatusCode::NOT_ACCEPTABLE,
-            "GET /mcp requires text/event-stream",
-        ));
-    }
-
-    let rx = state.fanout.subscribe();
-    let header = stream::once(async {
-        Ok::<_, Infallible>(Frame::data(Bytes::from("event: endpoint\ndata: /mcp\n\n")))
-    });
-    let events = stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|kind| {
-            (
-                Ok::<_, Infallible>(Frame::data(Bytes::from(sse_notification(kind)))),
-                rx,
-            )
-        })
-    });
-    let body = StreamBody::new(header.chain(events)).boxed_unsync();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "keep-alive")
-        .body(body)
-        .map_err(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR, "sse response failed"))
+        .expect("rmcp HTTP service is infallible");
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(parts, body.boxed_unsync()))
 }
 
 async fn dispatch_method(
-    state: &HttpState,
+    dispatch: &McpHttpDispatch,
     caller: McpCaller,
     method: &str,
     params: Value,
 ) -> Result<McpHttpReply, String> {
-    match &state.dispatch {
+    match dispatch {
         McpHttpDispatch::Direct(callback) => match callback(caller, method.to_string(), params) {
             Ok(result) => Ok(McpHttpReply::result(result)),
             Err(message) => Ok(McpHttpReply::error(-32000, message)),
@@ -1030,12 +1083,6 @@ fn session_manifest_is_gone(session_uuid: &str) -> bool {
         return false;
     };
     workspaces.is_dir() && crate::env::session_manifest_path(session_uuid).is_none()
-}
-
-fn generate_http_session_id() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    format!("mcpsess_{}", encode_hex(&bytes))
 }
 
 async fn bind_loopback(preferred: Option<u16>) -> Result<TcpListener> {
@@ -1117,57 +1164,10 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn initialize_result(params: &Value) -> Value {
-    let requested = params
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
-    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
-        requested
-    } else {
-        DEFAULT_PROTOCOL_VERSION
-    };
-    json!({
-        "protocolVersion": protocol_version,
-        "capabilities": {
-            "tools": { "listChanged": true },
-            "prompts": { "listChanged": true },
-            "resources": { "listChanged": true }
-        },
-        "serverInfo": {
-            "name": "botster-hub",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    })
-}
-
-fn sse_notification(kind: McpListKind) -> String {
-    format!(
-        "event: message\ndata: {}\n\n",
-        json!({
-            "jsonrpc": "2.0",
-            "method": kind.notification_method()
-        })
-    )
-}
-
-fn empty_body() -> McpHttpBody {
-    Full::new(Bytes::new())
-        .map_err(|never| match never {})
-        .boxed_unsync()
-}
-
 fn full_body(bytes: impl Into<Bytes>) -> McpHttpBody {
     Full::new(bytes.into())
         .map_err(|never| match never {})
         .boxed_unsync()
-}
-
-fn empty_accepted() -> Response<McpHttpBody> {
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .body(empty_body())
-        .expect("empty accepted response")
 }
 
 fn http_error(status: StatusCode, message: &str) -> Response<McpHttpBody> {
@@ -1176,37 +1176,6 @@ fn http_error(status: StatusCode, message: &str) -> Response<McpHttpBody> {
         .header(CONTENT_TYPE, "application/json")
         .body(full_body(json!({ "error": message }).to_string()))
         .expect("error response")
-}
-
-fn jsonrpc_object(id: Option<Value>, result: Option<Value>, error: Option<Value>) -> Value {
-    let mut object = serde_json::Map::new();
-    object.insert("jsonrpc".to_string(), json!("2.0"));
-    object.insert("id".to_string(), id.unwrap_or(Value::Null));
-    if let Some(result) = result {
-        object.insert("result".to_string(), result);
-    }
-    if let Some(error) = error {
-        object.insert("error".to_string(), error);
-    }
-    Value::Object(object)
-}
-
-fn json_response(value: Value) -> Response<McpHttpBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(full_body(value.to_string()))
-        .expect("json response")
-}
-
-fn with_session_header(
-    mut response: Response<McpHttpBody>,
-    session_id: &str,
-) -> Response<McpHttpBody> {
-    if let Ok(value) = HeaderValue::from_str(session_id) {
-        response.headers_mut().insert("mcp-session-id", value);
-    }
-    response
 }
 
 /// Dispatch an authorized MCP method through Lua `lib.mcp`.
@@ -1632,15 +1601,44 @@ async fn post_mcp_line(
     token: &str,
     line: &str,
 ) -> Result<String> {
-    let response = client
+    let method = serde_json::from_str::<Value>(line).ok().and_then(|value| {
+        value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let key = format!("{url}\0{token}");
+    let request_lock = proxy_request_lock(&key);
+    let _request_guard = request_lock.lock().await;
+    if method.as_deref() != Some("initialize") && proxy_session(&key).is_none() {
+        initialize_proxy_session(client, url, token, &key).await?;
+    }
+
+    let mut request = client
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {token}"))
         .header(CONTENT_TYPE, "application/json")
+        .header(hyper::header::ACCEPT, "application/json, text/event-stream");
+    if method.as_deref() != Some("initialize") {
+        if let Some(session_id) = proxy_session(&key) {
+            request = request.header("mcp-session-id", session_id);
+        }
+    }
+    let response = request
         .body(line.to_string())
         .send()
         .await
         .with_context(|| format!("proxy MCP POST to {url}"))?;
     let status = response.status();
+    if method.as_deref() == Some("initialize") && status.is_success() {
+        if let Some(session_id) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+        {
+            set_proxy_session(key, session_id.to_string());
+        }
+    }
     let body = response.text().await.unwrap_or_default();
     if status == StatusCode::UNAUTHORIZED {
         anyhow::bail!("shared MCP HTTP proxy received HTTP {status}");
@@ -1648,7 +1646,106 @@ async fn post_mcp_line(
     if !status.is_success() && body.trim().is_empty() {
         anyhow::bail!("shared MCP HTTP proxy received HTTP {status}");
     }
-    Ok(body)
+    Ok(json_from_mcp_http_body(&body).unwrap_or(body))
+}
+
+fn proxy_sessions() -> &'static Mutex<HashMap<String, String>> {
+    use std::sync::OnceLock;
+    static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn proxy_request_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    use std::sync::OnceLock;
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn proxy_request_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = proxy_request_locks()
+        .lock()
+        .expect("MCP proxy request lock map poisoned");
+    Arc::clone(
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+fn proxy_session(key: &str) -> Option<String> {
+    proxy_sessions()
+        .lock()
+        .expect("MCP proxy session mutex poisoned")
+        .get(key)
+        .cloned()
+}
+
+fn set_proxy_session(key: String, session_id: String) {
+    proxy_sessions()
+        .lock()
+        .expect("MCP proxy session mutex poisoned")
+        .insert(key, session_id);
+}
+
+async fn initialize_proxy_session(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    key: &str,
+) -> Result<()> {
+    let response = client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .header(
+            hyper::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": "botster-proxy-initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "botster-stdio-proxy", "version": env!("CARGO_PKG_VERSION") }
+            }
+        }))
+        .send()
+        .await
+        .with_context(|| format!("initialize proxy MCP session at {url}"))?;
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("proxy MCP initialize did not return a session id"))?
+        .to_string();
+    set_proxy_session(key.to_string(), session_id.clone());
+    client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .header("mcp-session-id", session_id)
+        .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .with_context(|| format!("complete proxy MCP initialization at {url}"))?;
+    Ok(())
+}
+
+fn json_from_mcp_http_body(body: &str) -> Option<String> {
+    if serde_json::from_str::<Value>(body).is_ok() {
+        return Some(body.to_string());
+    }
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .find(|data| serde_json::from_str::<Value>(data).is_ok())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -1666,10 +1763,11 @@ mod tests {
             "tools/list" => Ok(json!({
                 "tools": [{
                     "name": format!("whoami_{}", caller.session_uuid),
-                    "description": format!("caller {}", caller.session_uuid),
-                    "inputSchema": { "type": "object" }
+                    "description": format!("caller {}", caller.session_uuid)
                 }]
             })),
+            "prompts/list" => Ok(json!({ "prompts": [] })),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 if name != format!("whoami_{}", caller.session_uuid) {
@@ -1706,19 +1804,153 @@ mod tests {
         method: &str,
         params: Value,
     ) -> (StatusCode, Value) {
-        let mut request = reqwest::Client::new().post(url).json(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        }));
+        let client = reqwest::Client::new();
+        let token_key = token.map(|value| format!("{url}\0{value}"));
+        let sessions = test_sessions();
+        if method != "initialize" {
+            if let (Some(token), Some(key)) = (token, token_key.as_ref()) {
+                if !sessions
+                    .lock()
+                    .expect("test session mutex")
+                    .contains_key(key)
+                {
+                    initialize_test_session(&client, url, token, key).await;
+                }
+            }
+        }
+
+        let params = if method == "initialize" {
+            let protocol_version = params
+                .get("protocolVersion")
+                .cloned()
+                .unwrap_or_else(|| json!("2025-06-18"));
+            json!({
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": { "name": "botster-http-test", "version": "1" }
+            })
+        } else {
+            params
+        };
+        let mut request = client
+            .post(url)
+            .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }));
         if let Some(token) = token {
             request = request.header(AUTHORIZATION, format!("Bearer {token}"));
         }
+        if method != "initialize" {
+            if let Some(session_id) = token_key.as_ref().and_then(|key| {
+                sessions
+                    .lock()
+                    .expect("test session mutex")
+                    .get(key)
+                    .cloned()
+            }) {
+                request = request.header("mcp-session-id", session_id);
+            }
+        }
         let response = request.send().await.expect("http post");
         let status = response.status();
-        let body = response.json::<Value>().await.unwrap_or(json!({}));
+        if method == "initialize" && status.is_success() {
+            if let (Some(key), Some(session_id)) = (
+                token_key,
+                response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            ) {
+                sessions
+                    .lock()
+                    .expect("test session mutex")
+                    .insert(key, session_id);
+            }
+        }
+        let response_body = response.text().await.unwrap_or_default();
+        let body = json_from_mcp_http_body(&response_body)
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .unwrap_or(json!({}));
         (status, body)
+    }
+
+    fn test_sessions() -> &'static Mutex<HashMap<String, String>> {
+        use std::sync::OnceLock;
+        static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    async fn initialize_test_session(client: &reqwest::Client, url: &str, token: &str, key: &str) {
+        let response = client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": "auto-initialize",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "botster-http-test", "version": "1" }
+                }
+            }))
+            .send()
+            .await
+            .expect("initialize test MCP session");
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("MCP session header")
+            .to_string();
+        test_sessions()
+            .lock()
+            .expect("test session mutex")
+            .insert(key.to_string(), session_id.clone());
+        let _ = client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("mcp-session-id", session_id)
+            .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .send()
+            .await
+            .expect("send initialized notification");
+    }
+
+    async fn shared_client_tools_list(
+        client: &reqwest::Client,
+        url: &str,
+        token: &str,
+        session_id: &str,
+        id: u64,
+    ) -> Value {
+        let response = client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("mcp-session-id", session_id)
+            .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/list",
+                "params": {}
+            }))
+            .send()
+            .await
+            .expect("shared client tools/list");
+        let body = response.text().await.expect("shared client body");
+        let body = json_from_mcp_http_body(&body).unwrap_or(body);
+        serde_json::from_str(&body).expect("shared client JSON-RPC response")
     }
 
     #[test]
@@ -1901,6 +2133,93 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_http_posts_complete_on_one_mcp_session() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-concurrent", "hub-1"))
+                .expect("issue");
+            let url = listener.url().to_string();
+            let token = issued.token.as_str().to_string();
+            let (_, initialized) = rpc(&url, Some(&token), 1, "initialize", json!({})).await;
+            assert!(initialized.get("result").is_some());
+
+            for sequence in 0..16 {
+                let pair = async {
+                    tokio::join!(
+                        rpc(
+                            &url,
+                            Some(&token),
+                            sequence * 2 + 2,
+                            "tools/list",
+                            json!({})
+                        ),
+                        rpc(
+                            &url,
+                            Some(&token),
+                            sequence * 2 + 3,
+                            "tools/list",
+                            json!({})
+                        )
+                    )
+                };
+                let (first, second) = tokio::time::timeout(Duration::from_secs(2), pair)
+                    .await
+                    .expect("concurrent MCP requests must finish");
+                assert!(first.1.get("result").is_some());
+                assert!(second.1.get("result").is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn shared_http_client_can_reuse_connections_for_concurrent_posts() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-shared-client", "hub-1"))
+                .expect("issue");
+            let url = listener.url().to_string();
+            let token = issued.token.as_str().to_string();
+            let key = format!("{url}\0{token}");
+            let client = reqwest::Client::new();
+            initialize_test_session(&client, &url, &token, &key).await;
+            let session_id = test_sessions()
+                .lock()
+                .expect("test session mutex")
+                .get(&key)
+                .cloned()
+                .expect("MCP session id");
+
+            for sequence in 0..16 {
+                let pair = async {
+                    tokio::join!(
+                        shared_client_tools_list(
+                            &client,
+                            &url,
+                            &token,
+                            &session_id,
+                            sequence * 2 + 1
+                        ),
+                        shared_client_tools_list(
+                            &client,
+                            &url,
+                            &token,
+                            &session_id,
+                            sequence * 2 + 2
+                        )
+                    )
+                };
+                let (first, second) = tokio::time::timeout(Duration::from_secs(2), pair)
+                    .await
+                    .expect("shared client MCP requests must finish");
+                assert!(first.get("result").is_some());
+                assert!(second.get("result").is_some());
+            }
+        });
+    }
+
+    #[test]
     fn hub_restart_restores_port_and_caller_token() {
         test_runtime().block_on(async {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1937,6 +2256,10 @@ mod tests {
                 restored.authorize(&token).expect("restored").session_uuid,
                 "sess-recover"
             );
+            test_sessions()
+                .lock()
+                .expect("test session mutex")
+                .remove(&format!("{url}\0{token}"));
             let (_, again) = rpc(&url, Some(&token), 2, "tools/list", json!({})).await;
             assert_eq!(again["result"]["tools"][0]["name"], "whoami_sess-recover");
         });
@@ -2024,12 +2347,16 @@ mod tests {
     }
 
     #[test]
-    fn list_changed_notification_has_no_caller_payload() {
-        let tools = sse_notification(McpListKind::Tools);
-        assert!(tools.contains("notifications/tools/list_changed"));
-        assert!(!tools.contains("session_uuid"));
-        assert!(!tools.contains("hub_id"));
-        assert!(!tools.contains("btcaller_"));
+    fn handler_advertises_each_implemented_capability() {
+        let handler = HttpMcpHandler {
+            caller: McpCaller::new("sess-info", "hub-1"),
+            fanout: McpHttpFanout::new(),
+            dispatch: scoped_dispatcher(),
+        };
+        let info = handler.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.prompts.is_some());
+        assert!(info.capabilities.resources.is_some());
     }
 
     #[test]
@@ -2041,6 +2368,38 @@ mod tests {
                 .expect("issue");
             let url = listener.url().to_string();
             let token = issued.token.as_str().to_string();
+            let (_, initialized) = rpc(
+                &url,
+                Some(&token),
+                1,
+                "initialize",
+                json!({ "protocolVersion": "2025-06-18" }),
+            )
+            .await;
+            assert!(initialized.get("result").is_some());
+            let session_key = format!("{url}\0{token}");
+            let session_id = test_sessions()
+                .lock()
+                .expect("test session mutex")
+                .get(&session_key)
+                .cloned()
+                .expect("MCP session id");
+            let initialized_response = reqwest::Client::new()
+                .post(&url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("mcp-session-id", &session_id)
+                .header(
+                    hyper::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }))
+                .send()
+                .await
+                .expect("initialized notification");
+            assert_eq!(initialized_response.status(), StatusCode::ACCEPTED);
             let host = url
                 .strip_prefix("http://")
                 .and_then(|rest| rest.split('/').next())
@@ -2054,7 +2413,7 @@ mod tests {
                     .await
                     .expect("sse connect");
                 let request = format!(
-                    "GET /mcp HTTP/1.1\r\nHost: {host_for_get}\r\nAuthorization: Bearer {token_for_get}\r\nAccept: text/event-stream\r\n\r\n"
+                    "GET /mcp HTTP/1.1\r\nHost: {host_for_get}\r\nAuthorization: Bearer {token_for_get}\r\nMcp-Session-Id: {session_id}\r\nAccept: text/event-stream\r\n\r\n"
                 );
                 stream.write_all(request.as_bytes()).await.expect("sse write");
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2079,10 +2438,7 @@ mod tests {
                 body
             });
             let body = join.await.expect("sse task");
-            assert!(
-                body.contains("event: endpoint"),
-                "SSE must start with the endpoint event: {body}"
-            );
+            assert!(body.contains("200 OK"), "SSE must connect: {body}");
             assert!(
                 body.contains("notifications/tools/list_changed"),
                 "held SSE must deliver list_changed: {body}"
@@ -2111,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_echoes_supported_protocol_version_and_batch() {
+    fn initialize_negotiates_protocol_and_resources_list_is_implemented() {
         test_runtime().block_on(async {
             let (callers, _fanout, listener) = start_server().await;
             let issued = callers
@@ -2127,20 +2483,73 @@ mod tests {
             .await;
             assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
 
-            let response = reqwest::Client::new()
-                .post(listener.url())
-                .header(AUTHORIZATION, format!("Bearer {}", issued.token.as_str()))
-                .json(&json!([
-                    {"jsonrpc":"2.0","id":2,"method":"ping","params":{}},
-                    {"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}
-                ]))
-                .send()
-                .await
-                .expect("batch");
-            let batch = response.json::<Value>().await.expect("batch json");
-            assert!(batch.is_array());
-            assert_eq!(batch[0]["result"], json!({}));
-            assert_eq!(batch[1]["result"]["protocolVersion"], "2024-11-05");
+            let (status, resources) = rpc(
+                listener.url(),
+                Some(issued.token.as_str()),
+                2,
+                "resources/list",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(resources["result"]["resources"], json!([]));
+        });
+    }
+
+    #[test]
+    fn protocol_2026_cacheable_results_include_required_envelope() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-protocol-2026", "hub-1"))
+                .expect("issue");
+            let client = reqwest::Client::new();
+            let url = listener.url();
+            let token = issued.token.as_str();
+
+            for (id, method, collection) in [
+                (2, "tools/list", "tools"),
+                (3, "prompts/list", "prompts"),
+                (4, "resources/list", "resources"),
+                (5, "resources/templates/list", "resourceTemplates"),
+            ] {
+                let response = client
+                    .post(url)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header("mcp-protocol-version", "2026-07-28")
+                    .header("mcp-method", method)
+                    .header(hyper::header::ACCEPT, "application/json, text/event-stream")
+                    .json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": method,
+                        "params": {
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientInfo": {
+                                    "name": "claude-code-compatible-test",
+                                    "version": "1"
+                                },
+                                "io.modelcontextprotocol/clientCapabilities": {}
+                            }
+                        }
+                    }))
+                    .send()
+                    .await
+                    .unwrap_or_else(|error| panic!("protocol 2026 {method}: {error}"));
+                assert_eq!(response.status(), StatusCode::OK, "{method}");
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| panic!("protocol 2026 {method} body: {error}"));
+                let body = json_from_mcp_http_body(&body).unwrap_or(body);
+                let response: Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|error| panic!("protocol 2026 {method} JSON-RPC: {error}"));
+                assert_eq!(response["result"]["resultType"], "complete", "{method}");
+                assert_eq!(response["result"]["ttlMs"], 0, "{method}");
+                assert_eq!(response["result"]["cacheScope"], "private", "{method}");
+                assert!(response["result"][collection].is_array(), "{method}");
+            }
         });
     }
 
@@ -2284,11 +2693,13 @@ mod tests {
             let parsed: Value = serde_json::from_str(&body).expect("proxy json");
             assert_eq!(parsed["result"]["tools"][0]["name"], "whoami_sess-proxy");
 
-            let first = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
-            let second = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
-            let (first, second) = tokio::join!(first, second);
-            assert!(first.expect("first").contains("whoami_sess-proxy"));
-            assert!(second.expect("second").contains("whoami_sess-proxy"));
+            for _ in 0..16 {
+                let first = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
+                let second = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
+                let (first, second) = tokio::join!(first, second);
+                assert!(first.expect("first").contains("whoami_sess-proxy"));
+                assert!(second.expect("second").contains("whoami_sess-proxy"));
+            }
         });
     }
 
@@ -2423,7 +2834,6 @@ mod tests {
                 session_uuid: "sess-old".to_string(),
                 hub_id: "hub-1".to_string(),
                 token: format!("{CALLER_TOKEN_PREFIX}{}", "ab".repeat(32)),
-                http_session_id: "mcpsess_old".to_string(),
                 issued_at: 1,
             }],
         };
