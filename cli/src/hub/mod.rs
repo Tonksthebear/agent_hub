@@ -950,6 +950,7 @@ impl Hub {
         if let Ok(path) = daemon::mcp_callers_path(&self.hub_identifier) {
             self.mcp_callers.set_persist_path(path);
             self.mcp_callers.restore_from_disk();
+            self.mcp_callers.prune_stale_callers();
         }
         let _guard = self.tokio_runtime.enter();
         match self.tokio_runtime.block_on(crate::mcp_http::bind_listener(

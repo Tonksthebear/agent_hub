@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,8 +84,8 @@ const HUB_LIST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Failed-auth attempts allowed in [`AUTH_FAIL_WINDOW`] before HTTP 429.
 ///
-/// Loopback TCP is reachable by every local process. The bearer token is the
-/// only secret. This cap slows guessing without locking out a single retry.
+/// This cap applies only to requests that fail authorization. A valid token
+/// is never delayed or rejected by the gate.
 const AUTH_FAIL_LIMIT: u32 = 20;
 
 /// Sliding window for failed-auth counting.
@@ -102,6 +102,12 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025
 
 /// Default Streamable HTTP protocol version when the client omits one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Drop persisted credentials older than this.
+///
+/// A recovered live PTY reconnects well before two weeks. Tokens for
+/// sessions whose processes died while the Hub was down must not live forever.
+const MAX_CREDENTIAL_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// HTTP body type that can be a finished JSON reply or a live SSE stream.
 type McpHttpBody = UnsyncBoxBody<Bytes, Infallible>;
@@ -151,6 +157,8 @@ pub struct McpCaller {
     pub hub_id: String,
     /// Streamable HTTP session id. This is not a Botster session UUID.
     pub http_session_id: String,
+    /// Unix seconds when this credential was first issued.
+    pub issued_at: u64,
     /// Extra caller context from the session, never another caller.
     pub context: HashMap<String, String>,
 }
@@ -168,6 +176,7 @@ impl McpCaller {
             session_uuid,
             hub_id,
             http_session_id: generate_http_session_id(),
+            issued_at: now_unix(),
             context,
         }
     }
@@ -300,6 +309,8 @@ struct PersistedCaller {
     hub_id: String,
     token: String,
     http_session_id: String,
+    #[serde(default)]
+    issued_at: u64,
 }
 
 impl std::fmt::Debug for CallerState {
@@ -363,12 +374,42 @@ impl McpCallerRegistry {
             if !entry.token.starts_with(CALLER_TOKEN_PREFIX) {
                 continue;
             }
+            if credential_is_expired(entry.issued_at) {
+                continue;
+            }
             let mut caller = McpCaller::new(entry.session_uuid.clone(), entry.hub_id);
             caller.http_session_id = entry.http_session_id;
+            caller.issued_at = entry.issued_at;
             state
                 .by_session
                 .insert(entry.session_uuid, entry.token.clone());
             state.by_token.insert(entry.token, caller);
+        }
+    }
+
+    /// Drop credentials for missing sessions and write the pruned snapshot.
+    pub fn prune_stale_callers(&self) {
+        let mut state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+        let stale: Vec<String> = state
+            .by_session
+            .iter()
+            .filter_map(|(session_uuid, token)| {
+                let issued_at = state.by_token.get(token).map(|caller| caller.issued_at)?;
+                if credential_is_expired(issued_at) || session_manifest_is_gone(session_uuid) {
+                    Some(session_uuid.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for session_uuid in &stale {
+            if let Some(token) = state.by_session.remove(session_uuid) {
+                state.by_token.remove(&token);
+            }
+        }
+        drop(state);
+        if !stale.is_empty() {
+            self.persist();
         }
     }
 
@@ -468,6 +509,18 @@ impl McpCallerRegistry {
         self.clear_live();
     }
 
+    /// Revoke every persisted token and write an empty snapshot.
+    ///
+    /// Used when the preferred listen port cannot be reclaimed so a stale
+    /// `BOTSTER_MCP_TOKEN` is already dead if it reaches a squatter.
+    pub fn revoke_all_persisted(&self) {
+        let mut state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
+        state.by_token.clear();
+        state.by_session.clear();
+        drop(state);
+        self.persist();
+    }
+
     fn persist(&self) {
         let state = self.inner.lock().expect("McpCallerRegistry mutex poisoned");
         let Some(path) = state.persist_path.clone() else {
@@ -486,6 +539,7 @@ impl McpCallerRegistry {
                         hub_id: caller.hub_id.clone(),
                         token: token.clone(),
                         http_session_id: caller.http_session_id.clone(),
+                        issued_at: caller.issued_at,
                     })
                 })
                 .collect(),
@@ -612,12 +666,17 @@ pub(crate) async fn bind_listener(
     fanout: McpHttpFanout,
     dispatch: McpHttpDispatch,
 ) -> Result<McpHttpListener> {
-    let listener = bind_loopback(callers.preferred_port())
+    let preferred = callers.preferred_port();
+    let listener = bind_loopback(preferred)
         .await
         .context("bind shared MCP HTTP listener")?;
     let addr = listener
         .local_addr()
         .context("read shared MCP HTTP listen address")?;
+    if preferred.is_some_and(|port| port != addr.port()) {
+        log::warn!("[mcp-http] preferred port was not reclaimed; revoking persisted caller tokens");
+        callers.revoke_all_persisted();
+    }
     let url = format!("http://{addr}{MCP_HTTP_PATH}");
     callers.set_url(url.clone());
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -633,7 +692,7 @@ pub(crate) async fn bind_listener(
             tokio::select! {
                 _ = &mut shutdown_rx => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else {
+                    let Ok((stream, peer)) = accepted else {
                         break;
                     };
                     let state = Arc::clone(&state);
@@ -641,7 +700,7 @@ pub(crate) async fn bind_listener(
                         let io = TokioIo::new(stream);
                         let service = service_fn(move |request| {
                             let state = Arc::clone(&state);
-                            async move { handle_request(state, request).await }
+                            async move { handle_request(state, request, peer.ip()).await }
                         });
                         let _ = http1::Builder::new().serve_connection(io, service).await;
                     });
@@ -664,40 +723,38 @@ struct HttpState {
 }
 
 struct AuthGate {
-    inner: Mutex<(u32, Instant)>,
+    inner: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl Default for AuthGate {
     fn default() -> Self {
         Self {
-            inner: Mutex::new((0, Instant::now())),
+            inner: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl AuthGate {
-    fn allow(&self) -> bool {
+    fn reject_failure(&self, peer: IpAddr) -> bool {
         let mut state = self.inner.lock().expect("AuthGate mutex poisoned");
-        if state.1.elapsed() > AUTH_FAIL_WINDOW {
-            *state = (0, Instant::now());
+        let entry = state.entry(peer).or_insert((0, Instant::now()));
+        if entry.1.elapsed() > AUTH_FAIL_WINDOW {
+            *entry = (0, Instant::now());
         }
-        state.0 < AUTH_FAIL_LIMIT
-    }
-
-    fn record_failure(&self) {
-        let mut state = self.inner.lock().expect("AuthGate mutex poisoned");
-        if state.1.elapsed() > AUTH_FAIL_WINDOW {
-            *state = (0, Instant::now());
+        if entry.0 >= AUTH_FAIL_LIMIT {
+            return true;
         }
-        state.0 = state.0.saturating_add(1);
+        entry.0 = entry.0.saturating_add(1);
+        false
     }
 }
 
 async fn handle_request(
     state: Arc<HttpState>,
     request: Request<Incoming>,
+    peer: IpAddr,
 ) -> Result<Response<McpHttpBody>, Infallible> {
-    Ok(match handle_request_inner(&state, request).await {
+    Ok(match handle_request_inner(&state, request, peer).await {
         Ok(response) => response,
         Err(response) => response,
     })
@@ -706,6 +763,7 @@ async fn handle_request(
 async fn handle_request_inner(
     state: &HttpState,
     request: Request<Incoming>,
+    peer: IpAddr,
 ) -> Result<Response<McpHttpBody>, Response<McpHttpBody>> {
     if request.uri().path() != MCP_HTTP_PATH {
         return Err(http_error(StatusCode::NOT_FOUND, "not found"));
@@ -713,24 +771,18 @@ async fn handle_request_inner(
     if !origin_allowed(request.headers()) {
         return Err(http_error(StatusCode::FORBIDDEN, "invalid Origin"));
     }
-    if !state.auth_gate.allow() {
-        return Err(http_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed caller credentials",
-        ));
-    }
 
     let Some(token) = extract_bearer(request.headers()) else {
-        state.auth_gate.record_failure();
-        return Err(http_error(
-            StatusCode::UNAUTHORIZED,
+        return Err(reject_unauthorized(
+            state,
+            peer,
             "missing or invalid caller credential",
         ));
     };
     let Some(caller) = state.callers.authorize(&token) else {
-        state.auth_gate.record_failure();
-        return Err(http_error(
-            StatusCode::UNAUTHORIZED,
+        return Err(reject_unauthorized(
+            state,
+            peer,
             "stale or unknown caller credential",
         ));
     };
@@ -952,6 +1004,34 @@ fn generate_caller_token() -> String {
     format!("{CALLER_TOKEN_PREFIX}{}", encode_hex(&bytes))
 }
 
+fn reject_unauthorized(state: &HttpState, peer: IpAddr, message: &str) -> Response<McpHttpBody> {
+    if state.auth_gate.reject_failure(peer) {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed caller credentials",
+        );
+    }
+    http_error(StatusCode::UNAUTHORIZED, message)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn credential_is_expired(issued_at: u64) -> bool {
+    issued_at > 0 && now_unix().saturating_sub(issued_at) > MAX_CREDENTIAL_AGE.as_secs()
+}
+
+fn session_manifest_is_gone(session_uuid: &str) -> bool {
+    let Some(workspaces) = crate::env::data_dir().map(|dir| dir.join("workspaces")) else {
+        return false;
+    };
+    workspaces.is_dir() && crate::env::session_manifest_path(session_uuid).is_none()
+}
+
 fn generate_http_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
@@ -988,7 +1068,7 @@ fn port_from_url(url: Option<&str>) -> Option<u16> {
 
 fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -999,6 +1079,9 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("open {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("write {}", path.display()))?;
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    file.set_permissions(permissions)
+        .with_context(|| format!("chmod {}", path.display()))?;
     Ok(())
 }
 
@@ -1492,8 +1575,12 @@ async fn run_stdio_proxy_async(url: &str, token: &str) -> Result<()> {
         let stdout = Arc::clone(&stdout);
         let url = Arc::clone(&url);
         let token = Arc::clone(&token);
+        while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
-            let body = proxy_http_line(&client, &url, &token, line).await?;
+            let body = match proxy_http_line(&client, &url, &token, &line).await {
+                Ok(body) => body,
+                Err(error) => jsonrpc_error_for_line(&line, error),
+            };
             let mut out = stdout.lock().await;
             out.write_all(body.as_bytes()).await?;
             if !body.ends_with('\n') {
@@ -1509,13 +1596,26 @@ async fn run_stdio_proxy_async(url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+fn jsonrpc_error_for_line(line: &str, error: impl std::fmt::Display) -> String {
+    let id = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(Value::Null);
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32603, "message": error.to_string() }
+    })
+    .to_string()
+}
+
 async fn proxy_http_line(
     client: &reqwest::Client,
     url: &str,
     token: &str,
-    line: String,
+    line: &str,
 ) -> Result<String> {
-    match post_mcp_line(client, url, token, &line).await {
+    match post_mcp_line(client, url, token, line).await {
         Ok(body) => Ok(body),
         Err(_) => {
             let retry_url = read_manifest_mcp_url().unwrap_or_else(|| url.to_string());
@@ -2178,16 +2278,14 @@ mod tests {
                 "params": {}
             })
             .to_string();
-            let body =
-                proxy_http_line(&client, listener.url(), issued.token.as_str(), line.clone())
-                    .await
-                    .expect("proxy line");
+            let body = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line)
+                .await
+                .expect("proxy line");
             let parsed: Value = serde_json::from_str(&body).expect("proxy json");
             assert_eq!(parsed["result"]["tools"][0]["name"], "whoami_sess-proxy");
 
-            let first =
-                proxy_http_line(&client, listener.url(), issued.token.as_str(), line.clone());
-            let second = proxy_http_line(&client, listener.url(), issued.token.as_str(), line);
+            let first = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
+            let second = proxy_http_line(&client, listener.url(), issued.token.as_str(), &line);
             let (first, second) = tokio::join!(first, second);
             assert!(first.expect("first").contains("whoami_sess-proxy"));
             assert!(second.expect("second").contains("whoami_sess-proxy"));
@@ -2237,5 +2335,117 @@ mod tests {
         assert!(matches_loopback_origin("http://localhost:1234"));
         assert!(!matches_loopback_origin("https://evil.example"));
         assert_eq!(port_from_url(Some("http://127.0.0.1:4321/mcp")), Some(4321));
+    }
+
+    #[test]
+    fn valid_token_still_works_after_failed_auth_cap() {
+        test_runtime().block_on(async {
+            let (callers, _fanout, listener) = start_server().await;
+            let issued = callers
+                .issue(McpCaller::new("sess-gate", "hub-1"))
+                .expect("issue");
+            let url = listener.url().to_string();
+            for id in 0..AUTH_FAIL_LIMIT {
+                let (status, _) = rpc(
+                    &url,
+                    Some("btcaller_unknown"),
+                    u64::from(id),
+                    "initialize",
+                    json!({}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+            }
+            let (status, body) = rpc(
+                &url,
+                Some(issued.token.as_str()),
+                100,
+                "initialize",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.get("result").is_some());
+
+            let (status, _) =
+                rpc(&url, Some("btcaller_unknown"), 101, "initialize", json!({})).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+            let (status, _) = rpc(
+                &url,
+                Some(issued.token.as_str()),
+                102,
+                "initialize",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn port_reclaim_failure_revokes_persisted_tokens() {
+        test_runtime().block_on(async {
+            let occupied =
+                tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("occupy");
+            let port = occupied.local_addr().expect("occupied addr").port();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("mcp_callers.json");
+            let callers = McpCallerRegistry::new();
+            callers.set_persist_path(&path);
+            callers.set_url(format!("http://127.0.0.1:{port}/mcp"));
+            let issued = callers
+                .issue(McpCaller::new("sess-squat", "hub-1"))
+                .expect("issue");
+            let fanout = McpHttpFanout::new();
+            let listener = bind_listener(callers.clone(), fanout, scoped_dispatcher())
+                .await
+                .expect("bind fallback");
+            assert_ne!(listener.url(), format!("http://127.0.0.1:{port}/mcp"));
+            assert!(
+                callers.authorize(issued.token.as_str()).is_none(),
+                "stale token must be dead before a new URL is published"
+            );
+            drop(occupied);
+        });
+    }
+
+    #[test]
+    fn restore_drops_expired_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp_callers.json");
+        let snapshot = McpCallerSnapshot {
+            port: Some(9),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            callers: vec![PersistedCaller {
+                session_uuid: "sess-old".to_string(),
+                hub_id: "hub-1".to_string(),
+                token: format!("{CALLER_TOKEN_PREFIX}{}", "ab".repeat(32)),
+                http_session_id: "mcpsess_old".to_string(),
+                issued_at: 1,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&snapshot).expect("json")).expect("write");
+        let callers = McpCallerRegistry::new();
+        callers.set_persist_path(&path);
+        callers.restore_from_disk();
+        assert_eq!(callers.caller_count(), 0);
+    }
+
+    #[test]
+    fn proxy_failure_returns_jsonrpc_error_with_request_id() {
+        let body = jsonrpc_error_for_line(
+            &json!({"jsonrpc":"2.0","id":7,"method":"tools/list"}).to_string(),
+            "connection refused",
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["error"]["code"], -32603);
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("connection refused"));
     }
 }
