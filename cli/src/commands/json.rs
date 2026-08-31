@@ -6,7 +6,10 @@
 //!
 //! # Path Notation
 //!
-//! Keys are specified using dot notation: `projects.myproject.hasTrust`
+//! Keys are specified using dot notation: `projects.myproject.hasTrust`.
+//! For `json-set`, numeric path segments navigate JSON arrays. Setting index
+//! equal to the array length appends a new element; setting beyond the next
+//! append position fails instead of filling gaps with nulls.
 //!
 //! # Examples
 //!
@@ -17,6 +20,9 @@
 //! # Set a value (creates intermediate objects if needed)
 //! botster json-set ~/.config/example/settings.json "projects.myproject.hasTrust" "true"
 //!
+//! # Set or append inside an array
+//! botster json-set ~/.config/botster/spawn_targets.json "targets.0.plugins.4" '"project-pipelines"'
+//!
 //! # Delete a key
 //! botster json-delete ~/.config/example/settings.json "projects.myproject.hasTrust"
 //! ```
@@ -24,6 +30,73 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+
+fn empty_container_for(next_key: &str) -> serde_json::Value {
+    if next_key.parse::<usize>().is_ok() {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        serde_json::json!({})
+    }
+}
+
+fn set_at_path(
+    current: &mut serde_json::Value,
+    keys: &[&str],
+    new_value: serde_json::Value,
+) -> Result<()> {
+    let key = keys[0];
+    let is_last = keys.len() == 1;
+
+    match current {
+        serde_json::Value::Object(obj) => {
+            if is_last {
+                obj.insert(key.to_string(), new_value);
+                return Ok(());
+            }
+
+            let child = obj
+                .entry(key.to_string())
+                .or_insert_with(|| empty_container_for(keys[1]));
+
+            if !child.is_object() && !child.is_array() {
+                *child = empty_container_for(keys[1]);
+            }
+
+            set_at_path(child, &keys[1..], new_value)
+        }
+        serde_json::Value::Array(items) => {
+            let index = key
+                .parse::<usize>()
+                .with_context(|| format!("Cannot navigate array with non-numeric key '{}'", key))?;
+
+            if index > items.len() {
+                anyhow::bail!(
+                    "Cannot set array index {} - next append position is {}",
+                    index,
+                    items.len()
+                );
+            }
+
+            if is_last {
+                if index == items.len() {
+                    items.push(new_value);
+                } else {
+                    items[index] = new_value;
+                }
+                return Ok(());
+            }
+
+            if index == items.len() {
+                items.push(empty_container_for(keys[1]));
+            } else if !items[index].is_object() && !items[index].is_array() {
+                items[index] = empty_container_for(keys[1]);
+            }
+
+            set_at_path(&mut items[index], &keys[1..], new_value)
+        }
+        _ => anyhow::bail!("Cannot navigate through '{}' - not an object or array", key),
+    }
+}
 
 /// Reads a value from a JSON file using dot-notation path.
 ///
@@ -99,31 +172,10 @@ pub fn set(file_path: &str, key_path: &str, new_value: &str) -> Result<()> {
 
     // Split the path and navigate/create structure
     let keys: Vec<&str> = key_path.split('.').collect();
-    let mut current = &mut root;
-
-    for (i, key) in keys.iter().enumerate() {
-        if i == keys.len() - 1 {
-            // Last key - set the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert(key.to_string(), parsed_value.clone());
-            } else {
-                anyhow::bail!("Cannot set key '{}' - parent is not an object", key);
-            }
-        } else {
-            // Navigate/create intermediate objects
-            if !current.is_object() {
-                anyhow::bail!("Cannot navigate through '{}' - not an object", key);
-            }
-
-            let obj = current.as_object_mut().expect("checked is_object() above");
-
-            // If key doesn't exist or exists but isn't an object, create/replace with empty object
-            if !obj.contains_key(*key) || !obj[*key].is_object() {
-                obj.insert(key.to_string(), serde_json::json!({}));
-            }
-            current = obj.get_mut(*key).expect("key was just inserted if missing");
-        }
+    if keys.is_empty() || (keys.len() == 1 && keys[0].is_empty()) {
+        anyhow::bail!("Cannot set root object");
     }
+    set_at_path(&mut root, &keys, parsed_value)?;
 
     // Write back to file with pretty formatting
     fs::write(
@@ -269,6 +321,50 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["a"]["b"]["c"], "deep");
+    }
+
+    #[test]
+    fn test_set_array_index_preserves_existing_array() {
+        let file = create_test_file(
+            r#"{"targets":[{"name":"one","plugins":["github","telegram","mcp","vault"]}]}"#,
+        );
+        let path = file.path().to_str().unwrap();
+
+        set(path, "targets.0.plugins.4", "\"project-pipelines\"").unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed["targets"].is_array());
+        assert!(parsed["targets"][0]["plugins"].is_array());
+        assert_eq!(parsed["targets"][0]["plugins"][4], "project-pipelines");
+    }
+
+    #[test]
+    fn test_set_creates_array_for_missing_numeric_path() {
+        let file = create_test_file(r#"{}"#);
+        let path = file.path().to_str().unwrap();
+
+        set(path, "targets.0.plugins.0", "\"project-pipelines\"").unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed["targets"].is_array());
+        assert!(parsed["targets"][0]["plugins"].is_array());
+        assert_eq!(parsed["targets"][0]["plugins"][0], "project-pipelines");
+    }
+
+    #[test]
+    fn test_set_array_index_beyond_append_position_fails() {
+        let file = create_test_file(r#"{"plugins":["github"]}"#);
+        let path = file.path().to_str().unwrap();
+
+        let result = set(path, "plugins.2", "\"project-pipelines\"");
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("next append position is 1"));
     }
 
     #[test]

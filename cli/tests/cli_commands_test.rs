@@ -64,6 +64,39 @@ fn test_json_set_command() {
     );
 }
 
+#[test]
+fn test_json_set_array_path_command() {
+    let temp_dir = TempDir::new().unwrap();
+    let json_file = temp_dir.path().join("spawn_targets.json");
+
+    std::fs::write(
+        &json_file,
+        r#"{"targets":[{"name":"Project","plugins":["github","telegram","mcp","vault"]}]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new("cargo")
+        .args(&[
+            "run",
+            "--quiet",
+            "--",
+            "json-set",
+            json_file.to_str().unwrap(),
+            "targets.0.plugins.4",
+            "\"project-pipelines\"",
+        ])
+        .output()
+        .expect("Failed to execute json-set command");
+
+    assert!(output.status.success(), "Command should succeed");
+
+    let contents = std::fs::read_to_string(&json_file).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert!(parsed["targets"].is_array());
+    assert!(parsed["targets"][0]["plugins"].is_array());
+    assert_eq!(parsed["targets"][0]["plugins"][4], "project-pipelines");
+}
+
 /// Test the json-delete command
 #[test]
 fn test_json_delete_command() {
